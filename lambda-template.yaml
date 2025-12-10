@@ -1,0 +1,66 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Supabase Download Service Lambda
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 256
+
+Parameters:
+  SupabaseUrl:
+    Type: String
+    Description: Supabase project URL
+  SupabaseServiceKey:
+    Type: String
+    Description: Supabase service key
+    NoEcho: true
+
+Resources:
+  DownloadFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: go1.x
+    Properties:
+      FunctionName: supabase-download-service
+      CodeUri: .
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - arm64 # Use Graviton2 for ~20% cost savings
+      Environment:
+        Variables:
+          SUPABASE_URL: !Ref SupabaseUrl
+          SUPABASE_SERVICE_KEY: !Ref SupabaseServiceKey
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /download
+            Method: POST
+        OptionsEvent:
+          Type: Api
+          Properties:
+            Path: /download
+            Method: OPTIONS
+
+  # API Gateway with usage plan for rate limiting (optional)
+  ApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: DownloadServicePlan
+      Description: Usage plan for download service
+      Throttle:
+        BurstLimit: 100
+        RateLimit: 50
+      Quota:
+        Limit: 10000
+        Period: DAY
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/download"
+  FunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt DownloadFunction.Arn
