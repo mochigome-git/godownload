@@ -401,8 +401,4 @@ MONITORING:
 
 ## License
 
-MIT
-
-```
-
-```
+[MIT](LICENSE)
