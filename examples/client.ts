@@ -1,4 +1,6 @@
-// Example TypeScript client for the download service
+// @ts-nocheck
+
+// Example TypeScript client for the godownload
 
 interface TableConfig {
   table: string;

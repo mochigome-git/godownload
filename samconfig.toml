@@ -1,0 +1,44 @@
+# SAM CLI configuration file
+# This file is generated after running `sam deploy --guided`
+# You can modify these values or create profiles for different environments
+
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "go-download-stack"
+resolve_s3 = true
+s3_prefix = "go-download-stack"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+# Parameter overrides - set these or use environment variables
+# parameter_overrides = "SupabaseUrl=https://xxx.supabase.co SupabaseServiceKey=xxx"
+disable_rollback = true
+parameter_overrides = "SupabaseUrl=\"https://wrrahsvkabcfrsbzmnlw.supabase.co\" Environment=\"production\""
+image_repositories = []
+
+[default.build.parameters]
+use_container = false
+
+[default.local_start_api.parameters]
+warm_containers = "EAGER"
+
+# Production profile
+
+[default.global.parameters]
+region = "ap-southeast-1"
+[prod.deploy.parameters]
+stack_name = "supabase-download-stack-prod"
+resolve_s3 = true
+s3_prefix = "supabase-download-service-prod"
+region = "ap-southeast-1"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+
+# Staging profile
+[staging.deploy.parameters]
+stack_name = "supabase-download-stack-staging"
+resolve_s3 = true
+s3_prefix = "supabase-download-service-staging"
+region = "ap-southeast-1"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
