@@ -2,103 +2,234 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"strings"
 
 	"godownload/internal/auth"
+	"godownload/internal/config"
 	"godownload/internal/handler"
+	"godownload/internal/logger"
 	"godownload/internal/supabase"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
+	"go.uber.org/zap"
 )
 
 var (
+	cfg            *config.Config
 	supabaseClient *supabase.Client
 	jwtVerifier    *auth.JWTVerifier
+	log            *zap.SugaredLogger
+	isLocal        bool
 )
 
 func init() {
-	supabaseURL := os.Getenv("SUPABASE_URL")
-	supabaseKey := os.Getenv("SUPABASE_SERVICE_KEY")
+	log = logger.Init()
 
-	supabaseClient = supabase.NewClient(supabaseURL, supabaseKey)
+	isLocal = os.Getenv("AWS_SAM_LOCAL") == "true" || os.Getenv("ENV") == "development"
+	log.Infow("Lambda initializing", "is_local", isLocal)
 
-	// Initialize JWT verifier with Supabase JWKS
+	cfg = config.MustLoad()
+	log.Infow("Configuration loaded", "supabase_url", cfg.SupabaseURL)
+
+	supabaseClient = supabase.NewClient(cfg.SupabaseURL, cfg.SupabaseServiceKey)
+	log.Info("Supabase client initialized")
+
 	var err error
-	jwtVerifier, err = auth.NewJWTVerifier(supabaseURL)
+	jwtVerifier, err = auth.NewJWTVerifier(cfg.SupabaseURL)
 	if err != nil {
-		panic("failed to initialize JWT verifier: " + err.Error())
+		log.Fatalw("Failed to initialize JWT verifier", "error", err)
+	}
+	log.Info("JWT verifier initialized")
+}
+
+func getCORSHeaders() map[string]string {
+	return map[string]string{
+		"Access-Control-Allow-Origin":      "*",
+		"Access-Control-Allow-Methods":     "GET, POST, PUT, DELETE, OPTIONS",
+		"Access-Control-Allow-Headers":     "Content-Type, Authorization, X-Requested-With, Accept, Origin",
+		"Access-Control-Expose-Headers":    "Content-Disposition, Content-Length, Content-Type",
+		"Access-Control-Max-Age":           "86400",
+		"Access-Control-Allow-Credentials": "false",
 	}
 }
 
-func handleRequest(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
-	// CORS headers
-	headers := map[string]string{
-		"Content-Type":                 "application/json",
-		"Access-Control-Allow-Origin":  "*",
-		"Access-Control-Allow-Headers": "Content-Type,Authorization",
-		"Access-Control-Allow-Methods": "POST,OPTIONS",
+// handleRequest uses APIGatewayV2HTTPRequest for HTTP API (SAM HttpApi)
+func handleRequest(ctx context.Context, request events.APIGatewayV2HTTPRequest) (events.APIGatewayV2HTTPResponse, error) {
+	defer logger.Sync()
+
+	headers := getCORSHeaders()
+
+	method := request.RequestContext.HTTP.Method
+	path := request.RequestContext.HTTP.Path
+
+	// Fallback to RawPath if Path is empty
+	if path == "" {
+		path = request.RawPath
 	}
 
-	// Handle preflight
-	if request.HTTPMethod == "OPTIONS" {
-		return events.APIGatewayProxyResponse{
+	log.Infow("Incoming request",
+		"method", method,
+		"path", path,
+		"raw_path", request.RawPath,
+		"is_local", isLocal,
+	)
+
+	// Handle OPTIONS preflight - MUST be first, before any auth
+	if method == "OPTIONS" {
+		log.Info("Handling OPTIONS preflight request")
+		return events.APIGatewayV2HTTPResponse{
 			StatusCode: 200,
 			Headers:    headers,
+			Body:       "",
 		}, nil
 	}
 
-	// Extract token from Authorization header
-	authHeader := request.Headers["Authorization"]
-	if authHeader == "" {
-		authHeader = request.Headers["authorization"]
+	// Health check - no auth required
+	if strings.Contains(path, "/health") || path == "/health" {
+		headers["Content-Type"] = "application/json"
+		return events.APIGatewayV2HTTPResponse{
+			StatusCode: 200,
+			Headers:    headers,
+			Body:       `{"status":"ok"}`,
+		}, nil
 	}
+
+	// Authenticate user
+	userID, err := authenticateRequest(request)
+	if err != nil {
+		headers["Content-Type"] = "application/json"
+		return errorResponse(http.StatusUnauthorized, err.Error(), headers), nil
+	}
+
+	// Route based on path
+	if strings.Contains(path, "/export") || path == "/export" {
+		return handleExport(ctx, request, userID, headers)
+	}
+	if strings.Contains(path, "/download") || path == "/download" {
+		return handleDownload(ctx, request, userID, headers)
+	}
+
+	// Unknown endpoint
+	headers["Content-Type"] = "application/json"
+	return errorResponse(http.StatusNotFound, fmt.Sprintf("Endpoint not found: %s", path), headers), nil
+}
+
+func authenticateRequest(request events.APIGatewayV2HTTPRequest) (string, error) {
+	// HTTP API v2 uses request.Headers (map[string]string, lowercase keys)
+	authHeader := request.Headers["authorization"]
+	if authHeader == "" {
+		authHeader = request.Headers["Authorization"]
+	}
+
+	log.Debugw("Request headers", "headers", request.Headers)
 
 	token := strings.TrimPrefix(authHeader, "Bearer ")
 	if token == "" || token == authHeader {
-		return errorResponse(http.StatusUnauthorized, "Missing or invalid authorization header", headers), nil
+		log.Warn("Missing or invalid authorization header")
+		return "", fmt.Errorf("missing or invalid authorization header")
 	}
 
-	// Verify JWT token
 	claims, err := jwtVerifier.VerifyToken(token)
 	if err != nil {
-		return errorResponse(http.StatusUnauthorized, "Invalid token: "+err.Error(), headers), nil
+		log.Warnw("Token verification failed", "error", err)
+		return "", fmt.Errorf("invalid token: %w", err)
 	}
 
-	// Get user ID from claims
 	userID, ok := claims["sub"].(string)
 	if !ok || userID == "" {
-		return errorResponse(http.StatusUnauthorized, "Invalid user ID in token", headers), nil
+		log.Warn("Invalid user ID in token")
+		return "", fmt.Errorf("invalid user ID in token")
 	}
 
-	// Parse request body
+	log.Debugw("User authenticated", "user_id", userID)
+	return userID, nil
+}
+
+func handleDownload(ctx context.Context, request events.APIGatewayV2HTTPRequest, userID string, headers map[string]string) (events.APIGatewayV2HTTPResponse, error) {
+	headers["Content-Type"] = "application/json"
+
 	var req handler.DownloadRequest
 	if err := json.Unmarshal([]byte(request.Body), &req); err != nil {
+		log.Warnw("Invalid request body", "error", err)
 		return errorResponse(http.StatusBadRequest, "Invalid request body: "+err.Error(), headers), nil
 	}
 
-	// Process download request
-	h := handler.NewDownloadHandler(supabaseClient)
+	log.Infow("Processing download request",
+		"user_id", userID,
+		"tables", len(req.Tables),
+	)
+
+	h := handler.NewDownloadHandler(supabaseClient, log)
 	result, err := h.ProcessDownload(ctx, &req, userID)
 	if err != nil {
+		log.Errorw("Download failed", "error", err, "user_id", userID)
 		return errorResponse(http.StatusInternalServerError, "Download failed: "+err.Error(), headers), nil
 	}
 
-	// Return response
+	log.Infow("Download completed",
+		"user_id", userID,
+		"tables", len(result.Tables),
+	)
+
 	responseBody, _ := json.Marshal(result)
-	return events.APIGatewayProxyResponse{
+	return events.APIGatewayV2HTTPResponse{
 		StatusCode: 200,
 		Headers:    headers,
 		Body:       string(responseBody),
 	}, nil
 }
 
-func errorResponse(statusCode int, message string, headers map[string]string) events.APIGatewayProxyResponse {
+func handleExport(ctx context.Context, request events.APIGatewayV2HTTPRequest, userID string, headers map[string]string) (events.APIGatewayV2HTTPResponse, error) {
+	var req handler.ExportRequest
+	if err := json.Unmarshal([]byte(request.Body), &req); err != nil {
+		log.Warnw("Invalid request body", "error", err)
+		headers["Content-Type"] = "application/json"
+		return errorResponse(http.StatusBadRequest, "Invalid request body: "+err.Error(), headers), nil
+	}
+
+	log.Infow("Processing export request",
+		"user_id", userID,
+		"tables", len(req.Tables),
+		"file_name", req.FileName,
+	)
+
+	downloadHandler := handler.NewDownloadHandler(supabaseClient, log)
+	exportHandler := handler.NewExportHandler(downloadHandler, log)
+
+	result, err := exportHandler.ProcessExport(ctx, &req, userID)
+	if err != nil {
+		log.Errorw("Export failed", "error", err, "user_id", userID)
+		headers["Content-Type"] = "application/json"
+		return errorResponse(http.StatusInternalServerError, "Export failed: "+err.Error(), headers), nil
+	}
+
+	log.Infow("Export completed",
+		"user_id", userID,
+		"file_name", result.FileName,
+		"file_size", result.FileSize,
+	)
+
+	headers["Content-Type"] = result.ContentType
+	headers["Content-Disposition"] = fmt.Sprintf("attachment; filename=\"%s\"", result.FileName)
+
+	return events.APIGatewayV2HTTPResponse{
+		StatusCode:      200,
+		Headers:         headers,
+		Body:            base64.StdEncoding.EncodeToString(result.Data),
+		IsBase64Encoded: true,
+	}, nil
+}
+
+func errorResponse(statusCode int, message string, headers map[string]string) events.APIGatewayV2HTTPResponse {
+	headers["Content-Type"] = "application/json"
 	body, _ := json.Marshal(map[string]string{"error": message})
-	return events.APIGatewayProxyResponse{
+	return events.APIGatewayV2HTTPResponse{
 		StatusCode: statusCode,
 		Headers:    headers,
 		Body:       string(body),

@@ -1,0 +1,25 @@
+{
+  "httpMethod": "POST",
+  "path": "/download",
+  "headers": {
+    "Content-Type": "application/json",
+    "Authorization": "Bearer eyJhbGciOi..."
+  },
+  "body": {
+    "tables": [
+      {
+        "table": "sensor_data",
+        "select": "*",
+        "in_column": "column_id",
+        "in_values": ["lotId_1", "lotId_2", "lotId_3"],
+        "filters": {
+          "device_id": "abc123"
+        },
+        "order_by": [{ "column": "created_at", "ascending": true }]
+      }
+    ],
+    "batch_size": 20,
+    "concurrency": 5,
+    "is_five_min": false
+  }
+}

@@ -10,27 +10,39 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"godownload/internal/logger"
+
+	"go.uber.org/zap"
 )
 
 type Client struct {
 	baseURL    string
 	apiKey     string
 	httpClient *http.Client
+	logger     *zap.SugaredLogger
 }
 
 func NewClient(baseURL, apiKey string) *Client {
+	log := logger.Get()
+	log.Infow("Creating Supabase client",
+		"base_url", baseURL,
+	)
+
 	return &Client{
 		baseURL: strings.TrimSuffix(baseURL, "/"),
 		apiKey:  apiKey,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		logger: log,
 	}
 }
 
 // QueryBuilder provides a fluent interface for building Supabase queries
 type QueryBuilder struct {
 	client     *Client
+	schema     string // PostgreSQL schema (default: public)
 	table      string
 	selectCols string
 	filters    []filter
@@ -44,12 +56,12 @@ type QueryBuilder struct {
 type filter struct {
 	column   string
 	operator string
-	value    interface{}
+	value    any
 }
 
 type inFilter struct {
 	column string
-	values []interface{}
+	values []any
 }
 
 type orderClause struct {
@@ -57,10 +69,11 @@ type orderClause struct {
 	ascending bool
 }
 
-// From starts a new query on the specified table
+// From starts a new query on the specified table (defaults to public schema)
 func (c *Client) From(table string) *QueryBuilder {
 	return &QueryBuilder{
 		client:     c,
+		schema:     "", // empty means public (default)
 		table:      table,
 		selectCols: "*",
 		filters:    make([]filter, 0),
@@ -70,6 +83,13 @@ func (c *Client) From(table string) *QueryBuilder {
 		offset:     0,
 		ctx:        context.Background(),
 	}
+}
+
+// Schema sets the PostgreSQL schema for the query
+// Use this for non-public schemas like "analytics", "auth", etc.
+func (q *QueryBuilder) Schema(schema string) *QueryBuilder {
+	q.schema = schema
+	return q
 }
 
 // WithContext sets the context for the query
@@ -85,37 +105,37 @@ func (q *QueryBuilder) Select(columns string) *QueryBuilder {
 }
 
 // Eq adds an equality filter
-func (q *QueryBuilder) Eq(column string, value interface{}) *QueryBuilder {
+func (q *QueryBuilder) Eq(column string, value any) *QueryBuilder {
 	q.filters = append(q.filters, filter{column: column, operator: "eq", value: value})
 	return q
 }
 
 // Neq adds a not-equal filter
-func (q *QueryBuilder) Neq(column string, value interface{}) *QueryBuilder {
+func (q *QueryBuilder) Neq(column string, value any) *QueryBuilder {
 	q.filters = append(q.filters, filter{column: column, operator: "neq", value: value})
 	return q
 }
 
 // Gt adds a greater-than filter
-func (q *QueryBuilder) Gt(column string, value interface{}) *QueryBuilder {
+func (q *QueryBuilder) Gt(column string, value any) *QueryBuilder {
 	q.filters = append(q.filters, filter{column: column, operator: "gt", value: value})
 	return q
 }
 
 // Gte adds a greater-than-or-equal filter
-func (q *QueryBuilder) Gte(column string, value interface{}) *QueryBuilder {
+func (q *QueryBuilder) Gte(column string, value any) *QueryBuilder {
 	q.filters = append(q.filters, filter{column: column, operator: "gte", value: value})
 	return q
 }
 
 // Lt adds a less-than filter
-func (q *QueryBuilder) Lt(column string, value interface{}) *QueryBuilder {
+func (q *QueryBuilder) Lt(column string, value any) *QueryBuilder {
 	q.filters = append(q.filters, filter{column: column, operator: "lt", value: value})
 	return q
 }
 
 // Lte adds a less-than-or-equal filter
-func (q *QueryBuilder) Lte(column string, value interface{}) *QueryBuilder {
+func (q *QueryBuilder) Lte(column string, value any) *QueryBuilder {
 	q.filters = append(q.filters, filter{column: column, operator: "lte", value: value})
 	return q
 }
@@ -133,13 +153,13 @@ func (q *QueryBuilder) ILike(column string, pattern string) *QueryBuilder {
 }
 
 // Is adds an IS filter (for null checks)
-func (q *QueryBuilder) Is(column string, value interface{}) *QueryBuilder {
+func (q *QueryBuilder) Is(column string, value any) *QueryBuilder {
 	q.filters = append(q.filters, filter{column: column, operator: "is", value: value})
 	return q
 }
 
 // In adds an IN filter
-func (q *QueryBuilder) In(column string, values []interface{}) *QueryBuilder {
+func (q *QueryBuilder) In(column string, values []any) *QueryBuilder {
 	q.inFilters = append(q.inFilters, inFilter{column: column, values: values})
 	return q
 }
@@ -163,14 +183,30 @@ func (q *QueryBuilder) Offset(offset int) *QueryBuilder {
 }
 
 // Execute runs the query and returns the results
-func (q *QueryBuilder) Execute() ([]map[string]interface{}, error) {
+func (q *QueryBuilder) Execute() ([]map[string]any, error) {
 	reqURL, err := q.buildURL()
 	if err != nil {
+		q.client.logger.Errorw("Failed to build URL",
+			"schema", q.schema,
+			"table", q.table,
+			"error", err,
+		)
 		return nil, fmt.Errorf("failed to build URL: %w", err)
 	}
 
+	q.client.logger.Debugw("Executing query",
+		"schema", q.schema,
+		"table", q.table,
+		"select", q.selectCols,
+		"filters_count", len(q.filters),
+		"in_filters_count", len(q.inFilters),
+	)
+
 	req, err := http.NewRequestWithContext(q.ctx, "GET", reqURL, nil)
 	if err != nil {
+		q.client.logger.Errorw("Failed to create request",
+			"error", err,
+		)
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
@@ -179,25 +215,62 @@ func (q *QueryBuilder) Execute() ([]map[string]interface{}, error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Prefer", "return=representation")
 
+	// Set schema via Accept-Profile header (PostgREST way)
+	if q.schema != "" {
+		req.Header.Set("Accept-Profile", q.schema)
+	}
+
+	start := time.Now()
 	resp, err := q.client.httpClient.Do(req)
+	duration := time.Since(start)
+
 	if err != nil {
+		q.client.logger.Errorw("Request failed",
+			"schema", q.schema,
+			"table", q.table,
+			"duration_ms", duration.Milliseconds(),
+			"error", err,
+		)
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		q.client.logger.Errorw("Failed to read response",
+			"schema", q.schema,
+			"table", q.table,
+			"error", err,
+		)
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		q.client.logger.Errorw("Supabase error",
+			"schema", q.schema,
+			"table", q.table,
+			"status_code", resp.StatusCode,
+			"response", string(body),
+		)
 		return nil, fmt.Errorf("supabase error (status %d): %s", resp.StatusCode, string(body))
 	}
 
-	var result []map[string]interface{}
+	var result []map[string]any
 	if err := json.Unmarshal(body, &result); err != nil {
+		q.client.logger.Errorw("Failed to parse response",
+			"schema", q.schema,
+			"table", q.table,
+			"error", err,
+		)
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
+
+	q.client.logger.Debugw("Query completed",
+		"schema", q.schema,
+		"table", q.table,
+		"duration_ms", duration.Milliseconds(),
+		"rows_returned", len(result),
+	)
 
 	return result, nil
 }
@@ -245,16 +318,28 @@ func (q *QueryBuilder) buildURL() (string, error) {
 }
 
 // RPC calls a stored procedure
-func (c *Client) RPC(ctx context.Context, functionName string, params map[string]interface{}) ([]byte, error) {
+func (c *Client) RPC(ctx context.Context, functionName string, params map[string]any) ([]byte, error) {
 	reqURL := fmt.Sprintf("%s/rest/v1/rpc/%s", c.baseURL, functionName)
+
+	c.logger.Debugw("Calling RPC function",
+		"function", functionName,
+	)
 
 	body, err := json.Marshal(params)
 	if err != nil {
+		c.logger.Errorw("Failed to marshal params",
+			"function", functionName,
+			"error", err,
+		)
 		return nil, fmt.Errorf("failed to marshal params: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, bytes.NewReader(body))
 	if err != nil {
+		c.logger.Errorw("Failed to create request",
+			"function", functionName,
+			"error", err,
+		)
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
@@ -262,20 +347,42 @@ func (c *Client) RPC(ctx context.Context, functionName string, params map[string
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("Content-Type", "application/json")
 
+	start := time.Now()
 	resp, err := c.httpClient.Do(req)
+	duration := time.Since(start)
+
 	if err != nil {
+		c.logger.Errorw("RPC request failed",
+			"function", functionName,
+			"duration_ms", duration.Milliseconds(),
+			"error", err,
+		)
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		c.logger.Errorw("Failed to read response",
+			"function", functionName,
+			"error", err,
+		)
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		c.logger.Errorw("RPC error",
+			"function", functionName,
+			"status_code", resp.StatusCode,
+			"response", string(respBody),
+		)
 		return nil, fmt.Errorf("supabase error (status %d): %s", resp.StatusCode, string(respBody))
 	}
+
+	c.logger.Debugw("RPC completed",
+		"function", functionName,
+		"duration_ms", duration.Milliseconds(),
+	)
 
 	return respBody, nil
 }
