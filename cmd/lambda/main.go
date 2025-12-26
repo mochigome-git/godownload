@@ -59,8 +59,9 @@ func getCORSHeaders() map[string]string {
 	}
 }
 
-// handleRequest uses APIGatewayV2HTTPRequest for HTTP API (SAM HttpApi)
-func handleRequest(ctx context.Context, request events.APIGatewayV2HTTPRequest) (events.APIGatewayV2HTTPResponse, error) {
+// handleRequest handles both Lambda Function URL and API Gateway V2 requests
+// They use the same event structure: events.LambdaFunctionURLRequest is an alias
+func handleRequest(ctx context.Context, request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
 	defer logger.Sync()
 
 	headers := getCORSHeaders()
@@ -80,10 +81,10 @@ func handleRequest(ctx context.Context, request events.APIGatewayV2HTTPRequest) 
 		"is_local", isLocal,
 	)
 
-	// Handle OPTIONS preflight - MUST be first, before any auth
+	// Handle OPTIONS preflight
 	if method == "OPTIONS" {
 		log.Info("Handling OPTIONS preflight request")
-		return events.APIGatewayV2HTTPResponse{
+		return events.LambdaFunctionURLResponse{
 			StatusCode: 200,
 			Headers:    headers,
 			Body:       "",
@@ -93,7 +94,7 @@ func handleRequest(ctx context.Context, request events.APIGatewayV2HTTPRequest) 
 	// Health check - no auth required
 	if strings.Contains(path, "/health") || path == "/health" {
 		headers["Content-Type"] = "application/json"
-		return events.APIGatewayV2HTTPResponse{
+		return events.LambdaFunctionURLResponse{
 			StatusCode: 200,
 			Headers:    headers,
 			Body:       `{"status":"ok"}`,
@@ -120,8 +121,8 @@ func handleRequest(ctx context.Context, request events.APIGatewayV2HTTPRequest) 
 	return errorResponse(http.StatusNotFound, fmt.Sprintf("Endpoint not found: %s", path), headers), nil
 }
 
-func authenticateRequest(request events.APIGatewayV2HTTPRequest) (string, error) {
-	// HTTP API v2 uses request.Headers (map[string]string, lowercase keys)
+func authenticateRequest(request events.LambdaFunctionURLRequest) (string, error) {
+	// Headers are lowercase in Function URL requests
 	authHeader := request.Headers["authorization"]
 	if authHeader == "" {
 		authHeader = request.Headers["Authorization"]
@@ -151,7 +152,7 @@ func authenticateRequest(request events.APIGatewayV2HTTPRequest) (string, error)
 	return userID, nil
 }
 
-func handleDownload(ctx context.Context, request events.APIGatewayV2HTTPRequest, userID string, headers map[string]string) (events.APIGatewayV2HTTPResponse, error) {
+func handleDownload(ctx context.Context, request events.LambdaFunctionURLRequest, userID string, headers map[string]string) (events.LambdaFunctionURLResponse, error) {
 	headers["Content-Type"] = "application/json"
 
 	var req handler.DownloadRequest
@@ -178,14 +179,14 @@ func handleDownload(ctx context.Context, request events.APIGatewayV2HTTPRequest,
 	)
 
 	responseBody, _ := json.Marshal(result)
-	return events.APIGatewayV2HTTPResponse{
+	return events.LambdaFunctionURLResponse{
 		StatusCode: 200,
 		Headers:    headers,
 		Body:       string(responseBody),
 	}, nil
 }
 
-func handleExport(ctx context.Context, request events.APIGatewayV2HTTPRequest, userID string, headers map[string]string) (events.APIGatewayV2HTTPResponse, error) {
+func handleExport(ctx context.Context, request events.LambdaFunctionURLRequest, userID string, headers map[string]string) (events.LambdaFunctionURLResponse, error) {
 	var req handler.ExportRequest
 	if err := json.Unmarshal([]byte(request.Body), &req); err != nil {
 		log.Warnw("Invalid request body", "error", err)
@@ -218,7 +219,7 @@ func handleExport(ctx context.Context, request events.APIGatewayV2HTTPRequest, u
 	headers["Content-Type"] = result.ContentType
 	headers["Content-Disposition"] = fmt.Sprintf("attachment; filename=\"%s\"", result.FileName)
 
-	return events.APIGatewayV2HTTPResponse{
+	return events.LambdaFunctionURLResponse{
 		StatusCode:      200,
 		Headers:         headers,
 		Body:            base64.StdEncoding.EncodeToString(result.Data),
@@ -226,10 +227,10 @@ func handleExport(ctx context.Context, request events.APIGatewayV2HTTPRequest, u
 	}, nil
 }
 
-func errorResponse(statusCode int, message string, headers map[string]string) events.APIGatewayV2HTTPResponse {
+func errorResponse(statusCode int, message string, headers map[string]string) events.LambdaFunctionURLResponse {
 	headers["Content-Type"] = "application/json"
 	body, _ := json.Marshal(map[string]string{"error": message})
-	return events.APIGatewayV2HTTPResponse{
+	return events.LambdaFunctionURLResponse{
 		StatusCode: statusCode,
 		Headers:    headers,
 		Body:       string(body),

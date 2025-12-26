@@ -1,4 +1,8 @@
+include .env
+export
+
 .PHONY: build build-arm clean test run-local deploy deploy-guided create-function update-function logs dev
+
 
 # Variables
 FUNCTION_NAME ?= go-download

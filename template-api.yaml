@@ -1,0 +1,143 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Supabase goDownload Service Lambda
+
+Globals:
+  Function:
+    Timeout: 300
+    MemorySize: 512
+
+Parameters:
+  SupabaseUrl:
+    Type: String
+    Description: Supabase project URL
+  SupabaseServiceKey:
+    Type: String
+    Description: Supabase service key
+    NoEcho: true
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - development
+      - production
+    Description: Environment (development or production)
+
+Resources:
+  DownloadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: godownload
+      # Use pre-built binary (built by Makefile)
+      CodeUri: .
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - arm64 # Use Graviton2 for ~20% cost savings
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          SUPABASE_URL: !Ref SupabaseUrl
+          SUPABASE_SERVICE_KEY: !Ref SupabaseServiceKey
+          ENV: !Ref Environment
+      Events:
+        # Export endpoints
+        ExportPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ServerlessHttpApi
+            Path: /export
+            Method: POST
+        ExportOptions:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ServerlessHttpApi
+            Path: /export
+            Method: OPTIONS
+        # Download endpoints
+        DownloadPost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ServerlessHttpApi
+            Path: /download
+            Method: POST
+        DownloadOptions:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ServerlessHttpApi
+            Path: /download
+            Method: OPTIONS
+        # Health endpoint
+        Health:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ServerlessHttpApi
+            Path: /health
+            Method: GET
+        HealthOptions:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ServerlessHttpApi
+            Path: /health
+            Method: OPTIONS
+      # VPC configuration (uncomment if needed)
+      # VpcConfig:
+      #   SecurityGroupIds:
+      #     - sg-xxxxx
+      #   SubnetIds:
+      #     - subnet-xxxxx
+    Metadata:
+      # Tell SAM to skip building - we use pre-built binary
+      BuildMethod: makefile
+
+  # API Gateway with CORS
+  ServerlessHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: v1
+      CorsConfiguration:
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+          - X-Requested-With
+          - Accept
+          - Origin
+        AllowOrigins:
+          - "http://localhost:8080"
+          - "http://localhost:3000"
+          - "http://localhost:5173"
+          - "https://your-production-domain.com"
+        ExposeHeaders:
+          - Content-Disposition
+          - Content-Length
+          - Content-Type
+        MaxAge: 86400
+        AllowCredentials: false
+
+  # CloudWatch Log Group with retention
+  DownloadFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${DownloadFunction}
+      RetentionInDays: 14
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/v1"
+  DownloadEndpoint:
+    Description: Download endpoint URL
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/v1/download"
+  FunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt DownloadFunction.Arn
+  FunctionName:
+    Description: Lambda function name
+    Value: !Ref DownloadFunction
