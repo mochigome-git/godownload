@@ -20,38 +20,38 @@ const (
 	DefaultPaginationSize = 1000 // Fetch 1000 rows per page for better performance
 )
 
-// TableConfig represents configuration for a single table query
-type TableConfig struct {
-	Schema   string         `json:"schema,omitempty"`
-	Table    string         `json:"table"`
-	Filters  map[string]any `json:"filters,omitempty"`
-	Select   string         `json:"select,omitempty"`
-	OrderBy  []OrderConfig  `json:"order_by,omitempty"`
-	Limit    int            `json:"limit,omitempty"`
-	InColumn string         `json:"in_column,omitempty"`
-	InValues []any          `json:"in_values,omitempty"`
+// DownloadRequest represents the incoming request structure
+type DownloadRequest struct {
+	Tables      []TableConfig `json:"tables"`
+	IsFiveMin   bool          `json:"is_five_min,omitempty"`
+	BatchSize   int           `json:"batch_size,omitempty"`  // How many in_values per batch query (default: 20)
+	Concurrency int           `json:"concurrency,omitempty"` // Max concurrent queries (default: 5)
 }
 
-// OrderConfig represents ordering configuration
+// TableConfig represents configuration for a single table query
+type TableConfig struct {
+	Schema  string         `json:"schema,omitempty"` // PostgreSQL schema (default: public)
+	Table   string         `json:"table"`
+	Filters map[string]any `json:"filters,omitempty"`
+	Select  string         `json:"select,omitempty"`
+	OrderBy []OrderConfig  `json:"order_by,omitempty"`
+	Limit   int            `json:"limit,omitempty"` // Limit per query
+
+	// For batch IN queries
+	InColumn string `json:"in_column,omitempty"`
+	InValues []any  `json:"in_values,omitempty"`
+}
+
 type OrderConfig struct {
 	Column    string `json:"column"`
 	Ascending bool   `json:"ascending"`
 }
 
-// DownloadRequest represents the incoming download request
-type DownloadRequest struct {
-	Tables      []TableConfig `json:"tables"`
-	IsFiveMin   bool          `json:"is_five_min,omitempty"`
-	BatchSize   int           `json:"batch_size,omitempty"`
-	Concurrency int           `json:"concurrency,omitempty"`
-}
-
-// DownloadResponse contains the downloaded data
+// DownloadResponse represents the response structure
 type DownloadResponse struct {
 	Tables []TableData `json:"tables"`
 }
 
-// TableData represents data from a single table
 type TableData struct {
 	Schema string           `json:"schema,omitempty"`
 	Table  string           `json:"table"`
@@ -59,7 +59,6 @@ type TableData struct {
 	Count  int              `json:"count"`
 }
 
-// DownloadHandler handles data download operations
 type DownloadHandler struct {
 	client      *supabase.Client
 	config      *config.Config
@@ -67,9 +66,8 @@ type DownloadHandler struct {
 	logger      *zap.SugaredLogger
 }
 
-// NewDownloadHandler creates a new download handler
 func NewDownloadHandler(client *supabase.Client, logger *zap.SugaredLogger) *DownloadHandler {
-	cfg := config.MustLoad()
+	cfg := config.Get()
 	return &DownloadHandler{
 		client:      client,
 		config:      cfg,
@@ -78,7 +76,7 @@ func NewDownloadHandler(client *supabase.Client, logger *zap.SugaredLogger) *Dow
 	}
 }
 
-// ProcessDownload downloads and transforms data from multiple tables
+// ProcessDownload handles the download request with transformation applied
 func (h *DownloadHandler) ProcessDownload(ctx context.Context, req *DownloadRequest, userID string) (*DownloadResponse, error) {
 	resp, err := h.ProcessDownloadRaw(ctx, req, userID)
 	if err != nil {
@@ -114,8 +112,20 @@ func (h *DownloadHandler) ProcessDownload(ctx context.Context, req *DownloadRequ
 
 // ProcessDownloadRaw handles the download request WITHOUT transformation
 func (h *DownloadHandler) ProcessDownloadRaw(ctx context.Context, req *DownloadRequest, userID string) (*DownloadResponse, error) {
-	h.logger.Infow("Starting raw download process",
+	batchSize := req.BatchSize
+	if batchSize <= 0 {
+		batchSize = DefaultBatchSize
+	}
+
+	concurrency := req.Concurrency
+	if concurrency <= 0 {
+		concurrency = DefaultConcurrency
+	}
+
+	h.logger.Debugw("Starting raw download process",
 		"user_id", userID,
+		"batch_size", batchSize,
+		"concurrency", concurrency,
 		"tables_count", len(req.Tables),
 	)
 
@@ -123,52 +133,62 @@ func (h *DownloadHandler) ProcessDownloadRaw(ctx context.Context, req *DownloadR
 	results := make([]TableData, len(req.Tables))
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	var wg sync.WaitGroup
-	errChan := make(chan error, len(req.Tables))
+	var firstErr error
 
-	for _, tableConfig := range req.Tables {
+	for i, tableConfig := range req.Tables {
 		wg.Add(1)
-		go func(tc TableConfig) {
+		go func(idx int, cfg TableConfig) {
 			defer wg.Done()
 
-			schema := tc.Schema
-			if schema == "" {
-				schema = "public"
-			}
+			h.logger.Debugw("Processing table",
+				"schema", cfg.Schema,
+				"table", cfg.Table,
+				"in_column", cfg.InColumn,
+				"in_values_count", len(cfg.InValues),
+				"filters", cfg.Filters,
+				"index", idx,
+			)
 
-			data, err := h.processTable(ctx, tc, req.BatchSize, req.Concurrency)
+			data, err := h.processTable(ctx, cfg, batchSize, sem)
 			if err != nil {
 				h.logger.Errorw("Failed to process table",
-					"schema", schema,
-					"table", tc.Table,
+					"schema", cfg.Schema,
+					"table", cfg.Table,
 					"error", err,
 				)
-				errChan <- fmt.Errorf("table %s.%s: %w", schema, tc.Table, err)
+				mu.Lock()
+				if firstErr == nil {
+					tableName := cfg.Table
+					if cfg.Schema != "" {
+						tableName = cfg.Schema + "." + cfg.Table
+					}
+					firstErr = fmt.Errorf("table %s: %w", tableName, err)
+				}
+				mu.Unlock()
 				return
 			}
 
 			mu.Lock()
-			results = append(results, TableData{
-				Schema: schema,
-				Table:  tc.Table,
+			results[idx] = TableData{
+				Schema: cfg.Schema,
+				Table:  cfg.Table,
 				Data:   data,
 				Count:  len(data),
-			})
+			}
 			mu.Unlock()
 
-			h.logger.Infow("Table processed successfully (raw)",
-				"schema", schema,
-				"table", tc.Table,
+			h.logger.Debugw("Table processed successfully (raw)",
+				"schema", cfg.Schema,
+				"table", cfg.Table,
 				"rows", len(data),
 			)
-		}(tableConfig)
+		}(i, tableConfig)
 	}
 
 	wg.Wait()
-	close(errChan)
 
-	for err := range errChan {
-		return nil, err
+	if firstErr != nil {
+		return nil, firstErr
 	}
 
 	h.logger.Infow("Raw download process completed",
@@ -339,17 +359,13 @@ func (h *DownloadHandler) processTableWithInValues(
 ) ([]map[string]any, error) {
 	batches := splitIntoBatches(config.InValues, batchSize)
 
-	// Create batches
-	batches := h.createBatches(tc.InValues, batchSize)
-
-	h.logger.Infow("Processing batched IN query",
-		"schema", tc.Schema,
-		"table", tc.Table,
-		"in_column", tc.InColumn,
-		"total_in_values", len(tc.InValues),
+	h.logger.Debugw("Processing batched IN query",
+		"schema", config.Schema,
+		"table", config.Table,
+		"in_column", config.InColumn,
+		"total_in_values", len(config.InValues),
 		"total_batches", len(batches),
 		"batch_size", batchSize,
-		"concurrency", concurrency,
 	)
 
 	type batchResult struct {
@@ -404,60 +420,25 @@ func (h *DownloadHandler) processTableWithInValues(
 	close(resultsChan)
 
 	var allData []map[string]any
+	var firstErr error
 
-	for i, batch := range batches {
-		// Retry logic
-		var data []map[string]any
-		var err error
-
-		for retry := 0; retry < MaxRetries; retry++ {
-			data, err = h.executeBatchQuery(ctx, tc, batch, i)
-			if err == nil {
-				break
+	for result := range resultsChan {
+		if result.err != nil {
+			if firstErr == nil {
+				firstErr = result.err
 			}
-
-			h.logger.Warnw("Batch query failed, retrying",
-				"batch_index", i,
-				"retry", retry+1,
-				"max_retries", MaxRetries,
-				"error", err,
-			)
-
-			// Exponential backoff
-			sleepDuration := time.Duration(RetryDelayMs*(retry+1)) * time.Millisecond
-			time.Sleep(sleepDuration)
+			continue
 		}
-
-		if err != nil {
-			h.logger.Errorw("Batch query failed after retries",
-				"schema", tc.Schema,
-				"table", tc.Table,
-				"batch_index", i,
-				"error", err,
-			)
-			return nil, err
-		}
-
-		allData = append(allData, data...)
-
-		h.logger.Debugw("Batch query completed",
-			"schema", tc.Schema,
-			"table", tc.Table,
-			"batch_index", i,
-			"total_batches", len(batches),
-			"rows_returned", len(data),
-			"total_rows_so_far", len(allData),
-		)
-
-		// Small delay between batches to avoid rate limiting
-		if i < len(batches)-1 {
-			time.Sleep(100 * time.Millisecond)
-		}
+		allData = append(allData, result.data...)
 	}
 
-	h.logger.Infow("All batches collected",
-		"schema", tc.Schema,
-		"table", tc.Table,
+	if firstErr != nil {
+		return nil, firstErr
+	}
+
+	h.logger.Debugw("All batches collected",
+		"schema", config.Schema,
+		"table", config.Table,
 		"total_rows", len(allData),
 	)
 
@@ -537,85 +518,14 @@ func splitIntoBatches(items []any, batchSize int) [][]any {
 	}
 
 	var batches [][]any
-	for i := 0; i < len(values); i += batchSize {
+	for i := 0; i < len(items); i += batchSize {
 		end := i + batchSize
-		if end > len(values) {
-			end = len(values)
+		if end > len(items) {
+			end = len(items)
 		}
-		batches = append(batches, values[i:end])
+		batches = append(batches, items[i:end])
 	}
 	return batches
-}
-
-func (h *DownloadHandler) executeSimpleQuery(ctx context.Context, tc TableConfig) ([]map[string]any, error) {
-	query := h.client.From(tc.Table).WithContext(ctx)
-
-	if tc.Schema != "" && tc.Schema != "public" {
-		query = query.Schema(tc.Schema)
-	}
-
-	selectStr := tc.Select
-	if selectStr == "" {
-		selectStr = "*"
-	}
-	query = query.Select(selectStr)
-
-	// Apply filters
-	for key, value := range tc.Filters {
-		query = query.Eq(key, value)
-	}
-
-	// Apply ordering
-	for _, order := range tc.OrderBy {
-		query = query.Order(order.Column, order.Ascending)
-	}
-
-	if tc.Limit > 0 {
-		query = query.Limit(tc.Limit)
-	}
-
-	return query.Execute()
-}
-
-func (h *DownloadHandler) executeBatchQuery(ctx context.Context, tc TableConfig, batchValues []any, batchIndex int) ([]map[string]any, error) {
-	h.logger.Debugw("Executing batch query",
-		"schema", tc.Schema,
-		"table", tc.Table,
-		"in_column", tc.InColumn,
-		"batch_index", batchIndex,
-		"batch_in_values_count", len(batchValues),
-	)
-
-	query := h.client.From(tc.Table).WithContext(ctx)
-
-	if tc.Schema != "" && tc.Schema != "public" {
-		query = query.Schema(tc.Schema)
-	}
-
-	selectStr := tc.Select
-	if selectStr == "" {
-		selectStr = "*"
-	}
-	query = query.Select(selectStr)
-
-	// Apply IN filter
-	query = query.In(tc.InColumn, batchValues)
-
-	// Apply additional filters
-	for key, value := range tc.Filters {
-		query = query.Eq(key, value)
-	}
-
-	// Apply ordering
-	for _, order := range tc.OrderBy {
-		query = query.Order(order.Column, order.Ascending)
-	}
-
-	if tc.Limit > 0 {
-		query = query.Limit(tc.Limit)
-	}
-
-	return query.Execute()
 }
 
 // groupByFiveMinutes groups data by 5-minute intervals
@@ -624,47 +534,44 @@ func groupByFiveMinutes(data []map[string]any) []map[string]any {
 		return data
 	}
 
-	// Sort by created_at first
-	sort.SliceStable(data, func(i, j int) bool {
-		aVal, aOk := data[i]["created_at"]
-		bVal, bOk := data[j]["created_at"]
-		if !aOk || !bOk {
-			return false
-		}
-		aStr, aStrOk := aVal.(string)
-		bStr, bStrOk := bVal.(string)
-		if !aStrOk || !bStrOk {
-			return false
-		}
-		return aStr < bStr
-	})
-
-	var result []map[string]any
-	var lastTime time.Time
+	grouped := make(map[string][]map[string]any)
 
 	for _, row := range data {
 		createdAt, ok := row["created_at"].(string)
 		if !ok {
-			result = append(result, row)
 			continue
 		}
 
 		t, err := time.Parse(time.RFC3339, createdAt)
 		if err != nil {
-			t, err = time.Parse("2006-01-02T15:04:05.999999", createdAt)
+			t, err = time.Parse("2006-01-02T15:04:05", createdAt)
 			if err != nil {
-				result = append(result, row)
-				continue
+				t, err = time.Parse("2006-01-02T15:04:05.999999", createdAt)
+				if err != nil {
+					continue
+				}
 			}
 		}
 
-		// Round to 5-minute interval
-		rounded := t.Truncate(5 * time.Minute)
+		minute := t.Minute()
+		roundedMinute := (minute / 5) * 5
+		roundedTime := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), roundedMinute, 0, 0, t.Location())
+		key := roundedTime.Format(time.RFC3339)
 
-		// Only keep if different from last interval
-		if rounded.After(lastTime) || lastTime.IsZero() {
-			result = append(result, row)
-			lastTime = rounded
+		grouped[key] = append(grouped[key], row)
+	}
+
+	var result []map[string]any
+	var keys []string
+	for k := range grouped {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		for _, item := range grouped[k] {
+			item["grouped_time"] = k
+			result = append(result, item)
 		}
 	}
 
