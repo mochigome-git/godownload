@@ -5,7 +5,7 @@ export
 
 
 # Variables
-FUNCTION_NAME ?= go-download
+FUNCTION_NAME ?= godownload
 AWS_REGION ?= ap-southeast-1
 STACK_NAME ?= go-download-stack
 

@@ -32,8 +32,8 @@ Resources:
       Handler: bootstrap
       Runtime: provided.al2023
       Architectures:
-        # - arm64 # Use Graviton2 for ~20% cost savings
-        - x86_64
+        - arm64 # Use Graviton2 for ~20% cost savings
+        # - x86_64
       Environment:
         Variables:
           SUPABASE_URL: !Ref SupabaseUrl

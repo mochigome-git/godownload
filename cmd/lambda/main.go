@@ -49,6 +49,10 @@ func init() {
 }
 
 func getCORSHeaders() map[string]string {
+	if !isLocal {
+		// Production: Lambda already handles CORS
+		return nil
+	}
 	return map[string]string{
 		"Access-Control-Allow-Origin":      "*",
 		"Access-Control-Allow-Methods":     "GET, POST, PUT, DELETE, OPTIONS",
@@ -64,7 +68,12 @@ func getCORSHeaders() map[string]string {
 func handleRequest(ctx context.Context, request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
 	defer logger.Sync()
 
-	headers := getCORSHeaders()
+	var headers map[string]string
+	if isLocal {
+		headers = getCORSHeaders()
+	} else {
+		headers = map[string]string{} // or nil
+	}
 
 	method := request.RequestContext.HTTP.Method
 	path := request.RequestContext.HTTP.Path
