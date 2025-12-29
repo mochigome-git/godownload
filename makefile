@@ -52,7 +52,7 @@ fmt:
 # Start local API Gateway (requires SAM CLI + Docker)
 local-api:
 	@echo "🌐 Starting local API Gateway..."
-	sam local start-api --template template.yaml --env-vars env.json
+	sam local start-api --host 0.0.0.0 --template template.yaml --env-vars env.json
 
 # Invoke function locally with test event
 local-invoke:
