@@ -42,26 +42,16 @@ type TableConfig struct {
 	InValues []any  `json:"in_values,omitempty"`
 }
 
-// OrderConfig represents ordering configuration
 type OrderConfig struct {
 	Column    string `json:"column"`
 	Ascending bool   `json:"ascending"`
 }
 
-// DownloadRequest represents the incoming download request
-type DownloadRequest struct {
-	Tables      []TableConfig `json:"tables"`
-	IsFiveMin   bool          `json:"is_five_min,omitempty"`
-	BatchSize   int           `json:"batch_size,omitempty"`
-	Concurrency int           `json:"concurrency,omitempty"`
-}
-
-// DownloadResponse contains the downloaded data
+// DownloadResponse represents the response structure
 type DownloadResponse struct {
 	Tables []TableData `json:"tables"`
 }
 
-// TableData represents data from a single table
 type TableData struct {
 	Schema string           `json:"schema,omitempty"`
 	Table  string           `json:"table"`
@@ -69,7 +59,6 @@ type TableData struct {
 	Count  int              `json:"count"`
 }
 
-// DownloadHandler handles data download operations
 type DownloadHandler struct {
 	client      *supabase.Client
 	config      *config.Config
@@ -144,12 +133,11 @@ func (h *DownloadHandler) ProcessDownloadRaw(ctx context.Context, req *DownloadR
 	results := make([]TableData, len(req.Tables))
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	var wg sync.WaitGroup
-	errChan := make(chan error, len(req.Tables))
+	var firstErr error
 
 	for i, tableConfig := range req.Tables {
 		wg.Add(1)
-		go func(tc TableConfig) {
+		go func(idx int, cfg TableConfig) {
 			defer wg.Done()
 
 			h.logger.Debugw("Processing table",
@@ -198,11 +186,9 @@ func (h *DownloadHandler) ProcessDownloadRaw(ctx context.Context, req *DownloadR
 	}
 
 	wg.Wait()
-	close(errChan)
 
-	// Check for errors
-	for err := range errChan {
-		return nil, err
+	if firstErr != nil {
+		return nil, firstErr
 	}
 
 	h.logger.Infow("Raw download process completed",
@@ -390,7 +376,6 @@ func (h *DownloadHandler) processTableWithInValues(
 
 	resultsChan := make(chan batchResult, len(batches))
 	var wg sync.WaitGroup
-	errChan := make(chan error, len(req.Tables))
 
 	for batchIdx, batch := range batches {
 		wg.Add(1)
@@ -540,31 +525,7 @@ func splitIntoBatches(items []any, batchSize int) [][]any {
 		}
 		batches = append(batches, items[i:end])
 	}
-
-	selectStr := tc.Select
-	if selectStr == "" {
-		selectStr = "*"
-	}
-	query = query.Select(selectStr)
-
-	// Apply IN filter
-	query = query.In(tc.InColumn, batchValues)
-
-	// Apply additional filters
-	for key, value := range tc.Filters {
-		query = query.Eq(key, value)
-	}
-
-	// Apply ordering
-	for _, order := range tc.OrderBy {
-		query = query.Order(order.Column, order.Ascending)
-	}
-
-	if tc.Limit > 0 {
-		query = query.Limit(tc.Limit)
-	}
-
-	return query.Execute()
+	return batches
 }
 
 // groupByFiveMinutes groups data by 5-minute intervals
@@ -578,7 +539,6 @@ func groupByFiveMinutes(data []map[string]any) []map[string]any {
 	for _, row := range data {
 		createdAt, ok := row["created_at"].(string)
 		if !ok {
-			result = append(result, row)
 			continue
 		}
 
