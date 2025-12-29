@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -33,6 +34,11 @@ type Config struct {
 	DBPassword string
 	DBName     string
 	DBCACert   string
+
+	// S3 Storage Configuration
+	S3Bucket      string // Supabase storage bucket name
+	S3ExportPath  string // Path prefix for exports (e.g., "exports/")
+	S3ExpiryHours int    // File expiry in hours (default: 24)
 
 	// Data transformation
 	JoinMappings  []JoinMapping
@@ -95,6 +101,11 @@ func load() *Config {
 		DBPassword:         getEnv("SUPABASE_DB_PASSWORD", ""),
 		DBName:             getEnv("SUPABASE_DB_NAME", "postgres"),
 		DBCACert:           getEnv("SUPABASE_CA_CERT", ""),
+
+		// S3 Storage Configuration
+		S3Bucket:      getEnv("SUPABASE_STORAGE_BUCKET", "exports"),
+		S3ExportPath:  getEnv("SUPABASE_STORAGE_EXPORT_PATH", "exports/"),
+		S3ExpiryHours: getEnvInt("SUPABASE_STORAGE_EXPIRY_HOURS", 24),
 	}
 
 	// Parse JOIN_MAPPINGS
@@ -256,6 +267,15 @@ func (c *Config) ShouldFlattenJSONB(schema, table, column string) bool {
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
+	}
+	return defaultValue
+}
+
+func getEnvInt(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		if intVal, err := strconv.Atoi(value); err == nil {
+			return intVal
+		}
 	}
 	return defaultValue
 }

@@ -1,0 +1,40 @@
+sequenceDiagram
+    participant Frontend
+    participant Lambda
+    participant Supabase DB
+    participant Supabase Storage
+
+    Note over Frontend: User initiates export
+    
+    Frontend->>Frontend: Get JWT token from session
+    Frontend->>Lambda: POST /export<br/>(Authorization: Bearer JWT)
+    
+    Note over Lambda: Verify JWT token<br/>(User authentication)
+    
+    Lambda->>Lambda: Extract userID from JWT
+    
+    Note over Lambda: Use Service Key<br/>(NOT JWT)
+    
+    Lambda->>Supabase DB: Query data<br/>(Authorization: Bearer SERVICE_KEY)
+    Supabase DB-->>Lambda: Return data
+    
+    Lambda->>Lambda: Generate Excel file
+    
+    Lambda->>Supabase Storage: Upload file<br/>(Authorization: Bearer SERVICE_KEY)
+    Note over Supabase Storage: Store in exports bucket
+    Supabase Storage-->>Lambda: File path
+    
+    Lambda->>Supabase Storage: Generate signed URL<br/>(Authorization: Bearer SERVICE_KEY)
+    Supabase Storage-->>Lambda: Signed URL (expires in 24h)
+    
+    Lambda-->>Frontend: Return JSON<br/>{signed_url, file_name, expires_in}
+    
+    Frontend->>Supabase Storage: GET signed_url<br/>(No auth needed - URL has token)
+    Supabase Storage-->>Frontend: Excel file
+    
+    Note over Frontend: Browser downloads file
+
+    Note over Supabase Storage: After 24 hours<br/>URL becomes invalid
+
+
+    
