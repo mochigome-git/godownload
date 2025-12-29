@@ -26,12 +26,14 @@ type ExportRequest struct {
 	GroupBy     string            `json:"group_by,omitempty"`
 }
 
-// ExportResponse contains the Excel file data
+// ExportResponse contains the file information and signed URL
 type ExportResponse struct {
 	FileName    string `json:"file_name"`
+	FilePath    string `json:"file_path"`
+	SignedURL   string `json:"signed_url"`
+	ExpiresIn   int    `json:"expires_in"` // Hours
 	ContentType string `json:"content_type"`
 	FileSize    int64  `json:"file_size"`
-	Data        []byte `json:"-"`
 }
 
 // ExportHandler handles Excel export operations
@@ -61,7 +63,7 @@ func NewExportHandler(downloadHandler *DownloadHandler, logger *zap.SugaredLogge
 	}
 }
 
-// ProcessExport downloads data and converts to Excel
+// ProcessExport downloads data, converts to Excel, uploads to S3, and returns signed URL
 func (h *ExportHandler) ProcessExport(ctx context.Context, req *ExportRequest, userID string) (*ExportResponse, error) {
 	h.logger.Infow("Starting Excel export",
 		"user_id", userID,
@@ -110,17 +112,45 @@ func (h *ExportHandler) ProcessExport(ctx context.Context, req *ExportRequest, u
 		fileName += ".xlsx"
 	}
 
-	h.logger.Infow("Excel export completed",
+	// Upload to Supabase Storage using service key (NOT JWT)
+	// Pass the supabase client that has service key configured
+	storageHandler := NewStorageHandler(h.supabaseClient, h.config, h.logger)
+	filePath, err := storageHandler.UploadFile(ctx, fileName, excelData, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+	if err != nil {
+		h.logger.Errorw("Failed to upload file to storage",
+			"user_id", userID,
+			"file_name", fileName,
+			"error", err,
+		)
+		return nil, fmt.Errorf("failed to upload file: %w", err)
+	}
+
+	// Generate signed URL with expiry (also uses service key)
+	signedURL, err := storageHandler.GenerateSignedURL(ctx, filePath)
+	if err != nil {
+		h.logger.Errorw("Failed to generate signed URL",
+			"user_id", userID,
+			"file_path", filePath,
+			"error", err,
+		)
+		return nil, fmt.Errorf("failed to generate signed URL: %w", err)
+	}
+
+	h.logger.Infow("Excel export completed and uploaded to storage",
 		"user_id", userID,
 		"file_name", fileName,
+		"file_path", filePath,
 		"file_size", len(excelData),
+		"expires_in_hours", h.config.S3ExpiryHours,
 	)
 
 	return &ExportResponse{
 		FileName:    fileName,
+		FilePath:    filePath,
+		SignedURL:   signedURL,
+		ExpiresIn:   h.config.S3ExpiryHours,
 		ContentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 		FileSize:    int64(len(excelData)),
-		Data:        excelData,
 	}, nil
 }
 

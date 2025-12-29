@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -199,21 +198,20 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleExport(w http.ResponseWriter, r *http.Request) {
-	// Set CORS headers first
 	setCORSHeaders(w)
 
-	// Handle preflight
-	if r.Method == "OPTIONS" {
+	// Preflight
+	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	if r.Method != "POST" {
+	if r.Method != http.MethodPost {
 		errorResponse(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
 
-	// Extract token from Authorization header
+	// --- Auth ---
 	authHeader := r.Header.Get("Authorization")
 	token := strings.TrimPrefix(authHeader, "Bearer ")
 	if token == "" || token == authHeader {
@@ -222,15 +220,13 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify JWT token
 	claims, err := jwtVerifier.VerifyToken(token)
 	if err != nil {
 		log.Warnw("Token verification failed", "error", err)
-		errorResponse(w, http.StatusUnauthorized, "Invalid token: "+err.Error())
+		errorResponse(w, http.StatusUnauthorized, "Invalid token")
 		return
 	}
 
-	// Get user ID from claims
 	userID, ok := claims["sub"].(string)
 	if !ok || userID == "" {
 		log.Warn("Invalid user ID in token")
@@ -238,13 +234,11 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Debugw("User authenticated for export", "user_id", userID)
-
-	// Parse request body
+	// --- Parse request ---
 	var req handler.ExportRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		log.Warnw("Invalid request body", "error", err)
-		errorResponse(w, http.StatusBadRequest, "Invalid request body: "+err.Error())
+		errorResponse(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
 
@@ -254,14 +248,14 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 		"file_name", req.FileName,
 	)
 
-	// Process export request
+	// --- Process export ---
 	downloadHandler := handler.NewDownloadHandler(supabaseClient, log)
 	exportHandler := handler.NewExportHandler(downloadHandler, log)
 
 	result, err := exportHandler.ProcessExport(r.Context(), &req, userID)
 	if err != nil {
 		log.Errorw("Export failed", "error", err, "user_id", userID)
-		errorResponse(w, http.StatusInternalServerError, "Export failed: "+err.Error())
+		errorResponse(w, http.StatusInternalServerError, "Export failed")
 		return
 	}
 
@@ -271,11 +265,13 @@ func handleExport(w http.ResponseWriter, r *http.Request) {
 		"file_size", result.FileSize,
 	)
 
-	// Return Excel file
-	w.Header().Set("Content-Type", result.ContentType)
-	w.Header().Set("Content-Disposition", "attachment; filename=\""+result.FileName+"\"")
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", result.FileSize))
-	w.Write(result.Data)
+	// --- Return JSON instead of file ---
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	if err := json.NewEncoder(w).Encode(result); err != nil {
+		log.Errorw("Failed to encode export response", "error", err)
+	}
 }
 
 func errorResponse(w http.ResponseWriter, statusCode int, message string) {

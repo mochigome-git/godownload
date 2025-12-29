@@ -5,7 +5,11 @@ export
 
 
 # Variables
+<<<<<<< HEAD
 FUNCTION_NAME ?= go-download
+=======
+FUNCTION_NAME ?= godownload
+>>>>>>> b4958343ac1ca7aa7c690246d9522736f2278580
 AWS_REGION ?= ap-southeast-1
 STACK_NAME ?= go-download-stack
 
@@ -52,7 +56,7 @@ fmt:
 # Start local API Gateway (requires SAM CLI + Docker)
 local-api:
 	@echo "🌐 Starting local API Gateway..."
-	sam local start-api --template template.yaml --env-vars env.json
+	sam local start-api --host 0.0.0.0 --template template.yaml --env-vars env.json
 
 # Invoke function locally with test event
 local-invoke:

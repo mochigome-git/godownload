@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -49,6 +48,10 @@ func init() {
 }
 
 func getCORSHeaders() map[string]string {
+	if !isLocal {
+		// Production: Lambda already handles CORS
+		return nil
+	}
 	return map[string]string{
 		"Access-Control-Allow-Origin":      "*",
 		"Access-Control-Allow-Methods":     "GET, POST, PUT, DELETE, OPTIONS",
@@ -64,7 +67,12 @@ func getCORSHeaders() map[string]string {
 func handleRequest(ctx context.Context, request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
 	defer logger.Sync()
 
-	headers := getCORSHeaders()
+	var headers map[string]string
+	if isLocal {
+		headers = getCORSHeaders()
+	} else {
+		headers = map[string]string{} // or nil
+	}
 
 	method := request.RequestContext.HTTP.Method
 	path := request.RequestContext.HTTP.Path
@@ -210,30 +218,51 @@ func handleExport(ctx context.Context, request events.LambdaFunctionURLRequest, 
 		return errorResponse(http.StatusInternalServerError, "Export failed: "+err.Error(), headers), nil
 	}
 
-	log.Infow("Export completed",
+	log.Infow("Export completed and uploaded to storage",
 		"user_id", userID,
 		"file_name", result.FileName,
+		"file_path", result.FilePath,
 		"file_size", result.FileSize,
+		"expires_in_hours", result.ExpiresIn,
 	)
 
-	headers["Content-Type"] = result.ContentType
-	headers["Content-Disposition"] = fmt.Sprintf("attachment; filename=\"%s\"", result.FileName)
+	// Return JSON response with signed URL instead of binary data
+	responseBody, err := json.Marshal(result)
+	if err != nil {
+		log.Errorw("Failed to marshal response", "error", err)
+		headers["Content-Type"] = "application/json"
+		return errorResponse(http.StatusInternalServerError, "Failed to marshal response: "+err.Error(), headers), nil
+	}
+
+	// Set headers for JSON response
+	headers["Content-Type"] = "application/json"
+	// Remove Content-Disposition since we're not sending the file directly
+	delete(headers, "Content-Disposition")
 
 	return events.LambdaFunctionURLResponse{
 		StatusCode:      200,
 		Headers:         headers,
-		Body:            base64.StdEncoding.EncodeToString(result.Data),
-		IsBase64Encoded: true,
+		Body:            string(responseBody),
+		IsBase64Encoded: false, // JSON response, not binary
 	}, nil
 }
 
 func errorResponse(statusCode int, message string, headers map[string]string) events.LambdaFunctionURLResponse {
+	if headers == nil {
+		headers = make(map[string]string)
+	}
 	headers["Content-Type"] = "application/json"
-	body, _ := json.Marshal(map[string]string{"error": message})
+
+	errorBody := map[string]string{
+		"error": message,
+	}
+	body, _ := json.Marshal(errorBody)
+
 	return events.LambdaFunctionURLResponse{
-		StatusCode: statusCode,
-		Headers:    headers,
-		Body:       string(body),
+		StatusCode:      statusCode,
+		Headers:         headers,
+		Body:            string(body),
+		IsBase64Encoded: false,
 	}
 }
 

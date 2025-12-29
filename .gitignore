@@ -23,7 +23,7 @@ go.work.sum
 
 # env file
 .env
-
+env.json
 
 bootstrap
 deployment.zip
