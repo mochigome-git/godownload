@@ -464,7 +464,7 @@ func (h *ExportHandler) writeSheetData(f *excelize.File, sheetName string, data 
 
 	h.sortByCreatedAt(data)
 
-	columns := h.getColumnOrder(data[0], excludeColumn)
+	columns := h.getColumnOrder(data, excludeColumn) // ← was data[0], now data
 
 	for colIdx, colName := range columns {
 		cell, _ := excelize.CoordinatesToCellName(colIdx+1, 1)
@@ -595,12 +595,20 @@ func (h *ExportHandler) parseTime(val any) time.Time {
 	return time.Time{}
 }
 
-func (h *ExportHandler) getColumnOrder(row map[string]any, exclude string) []string {
-	columns := make([]string, 0, len(row))
-	for k := range row {
-		if k != exclude {
-			columns = append(columns, k)
+func (h *ExportHandler) getColumnOrder(data []map[string]any, exclude string) []string {
+	seen := make(map[string]struct{})
+	for _, row := range data {
+		for k := range row {
+			if k == exclude {
+				continue
+			}
+			seen[k] = struct{}{}
 		}
+	}
+
+	columns := make([]string, 0, len(seen))
+	for k := range seen {
+		columns = append(columns, k)
 	}
 
 	priority := map[string]int{"id": 0, "uuid": 1, "created_at": 2, "updated_at": 3}
