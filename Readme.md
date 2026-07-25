@@ -2,6 +2,30 @@
 
 A Go-based AWS Lambda service for authenticated batch downloads from Supabase tables.
 
+## Requirement
+
+# Amazon Linux 2023 Make
+
+```bash
+sudo dnf install -y make
+```
+
+# Amazon Linux 2023 Golang
+
+```bash
+sudo dnf install -y golang
+
+```
+
+# Amazon Linux 2023 SAM
+
+```bash
+curl -Lo aws-sam-cli-linux-arm64.zip https://github.com/aws/aws-sam-cli/releases/latest/download/aws-sam-cli-linux-arm64.zip
+unzip aws-sam-cli-linux-arm64.zip -d sam-installation
+sudo ./sam-installation/install
+sam --version
+```
+
 ## Quick Start
 
 ```bash
