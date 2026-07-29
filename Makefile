@@ -77,6 +77,15 @@ build-arm:
 	zip -j deployment.zip bootstrap
 	@echo "✅ Built: deployment.zip (arm64)"
 
+# SAM Makefile-builder target (used by `sam build` / `sam deploy` via
+# Metadata: BuildMethod: makefile in template.yaml). SAM calls this
+# target by name automatically — it must match "build-<LogicalId>"
+# from template.yaml (DownloadFunction). SAM sets $(ARTIFACTS_DIR)
+# and zips whatever lands there itself — don't touch deployment.zip here.
+build-DownloadFunction:
+	@echo "🔨 [SAM] Building DownloadFunction for ARM64..."
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags lambda.norpc -o $(ARTIFACTS_DIR)/bootstrap cmd/lambda/main.go
+
 # Clean build artifacts
 clean:
 	@echo "🧹 Cleaning..."
@@ -94,11 +103,15 @@ deploy-guided: build-arm
 
 # Subsequent deployments (uses samconfig.toml)
 deploy: build-arm
+	@echo "🚀 Building with SAM..."
+	sam build --template template.yaml
 	@echo "🚀 Deploying with SAM..."
 	sam deploy --template template.yaml
 
 # Deploy with specific parameters
 deploy-prod: build-arm
+	@echo "🚀 Building with SAM..."
+	sam build --template template.yaml
 	@echo "🚀 Deploying to production..."
 	sam deploy --template template.yaml \
 		--stack-name $(STACK_NAME)-prod \

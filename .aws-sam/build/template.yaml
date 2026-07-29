@@ -1,0 +1,87 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Supabase goDownload Service Lambda with Function URL
+Globals:
+  Function:
+    Timeout: 300
+    MemorySize: 512
+Parameters:
+  SupabaseUrl:
+    Type: String
+    Description: Supabase project URL
+  SupabaseServiceKey:
+    Type: String
+    Description: Supabase service key
+    NoEcho: true
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+    - development
+    - production
+    Description: Environment (development or production)
+Resources:
+  DownloadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: godownload
+      CodeUri: DownloadFunction
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+      - arm64
+      Environment:
+        Variables:
+          SUPABASE_URL:
+            Ref: SupabaseUrl
+          SUPABASE_SERVICE_KEY:
+            Ref: SupabaseServiceKey
+          ENV:
+            Ref: Environment
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowOrigins:
+          - '*'
+          AllowMethods:
+          - GET
+          - POST
+          AllowHeaders:
+          - Content-Type
+          - Authorization
+          - X-Requested-With
+          - Accept
+          - Origin
+          ExposeHeaders:
+          - Content-Disposition
+          - Content-Length
+          - Content-Type
+          MaxAge: 86400
+    Metadata:
+      BuildMethod: makefile
+      SamResourceId: DownloadFunction
+  DownloadFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${DownloadFunction}
+      RetentionInDays: 14
+Outputs:
+  FunctionUrl:
+    Description: Lambda Function URL (use this!)
+    Value:
+      Fn::GetAtt:
+      - DownloadFunctionUrl
+      - FunctionUrl
+  FunctionArn:
+    Description: Lambda function ARN
+    Value:
+      Fn::GetAtt:
+      - DownloadFunction
+      - Arn
+  FunctionName:
+    Description: Lambda function name
+    Value:
+      Ref: DownloadFunction
