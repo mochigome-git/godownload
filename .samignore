@@ -2,13 +2,19 @@
 .git/
 storage/
 sam-installation/
-aws-sam-cli-linux-arm64.zip
+aws-sam-cli-src/
+aws-sam-cli.zip
+install
+dist/
 examples/
 deployment.zip
 bootstrap
 Authentication flow.mmd
 Readme.md
+Readme.md.orig
 LICENSE
+THIRD-PARTY-LICENSES
 env.json
 example.env.json
-sample.env
+.env.save
+.env.save.1
