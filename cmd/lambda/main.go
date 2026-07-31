@@ -54,7 +54,7 @@ func getCORSHeaders() map[string]string {
 	}
 	return map[string]string{
 		"Access-Control-Allow-Origin":      "*",
-		"Access-Control-Allow-Methods":     "GET, POST, PUT, DELETE, OPTIONS",
+		"Access-Control-Allow-Methods":     "GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE",
 		"Access-Control-Allow-Headers":     "Content-Type, Authorization, X-Requested-With, Accept, Origin",
 		"Access-Control-Expose-Headers":    "Content-Disposition, Content-Length, Content-Type",
 		"Access-Control-Max-Age":           "86400",
@@ -130,17 +130,25 @@ func handleRequest(ctx context.Context, request events.LambdaFunctionURLRequest)
 }
 
 func authenticateRequest(request events.LambdaFunctionURLRequest) (string, error) {
-	// Headers are lowercase in Function URL requests
-	authHeader := request.Headers["authorization"]
+	// IMPORTANT: We read the app's JWT from X-App-Authorization, NOT
+	// Authorization. When CloudFront uses Origin Access Control (OAC) to sign
+	// requests to a Lambda Function URL, it needs to own the "Authorization"
+	// header itself for its SigV4 signature. If the app also sends its own
+	// bearer token in "Authorization", the two collide and CloudFront/Lambda
+	// reject the request with InvalidSignatureException. Using a separate
+	// header name avoids the collision entirely.
+	//
+	// Function URL headers arrive lowercased.
+	authHeader := request.Headers["x-app-authorization"]
 	if authHeader == "" {
-		authHeader = request.Headers["Authorization"]
+		authHeader = request.Headers["X-App-Authorization"]
 	}
 
 	log.Debugw("Request headers", "headers", request.Headers)
 
 	token := strings.TrimPrefix(authHeader, "Bearer ")
 	if token == "" || token == authHeader {
-		log.Warn("Missing or invalid authorization header")
+		log.Warn("Missing or invalid X-App-Authorization header")
 		return "", fmt.Errorf("missing or invalid authorization header")
 	}
 
