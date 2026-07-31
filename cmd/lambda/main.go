@@ -25,13 +25,28 @@ var (
 	jwtVerifier    *auth.JWTVerifier
 	log            *zap.SugaredLogger
 	isLocal        bool
+	behindProxy    bool
 )
 
 func init() {
 	log = logger.Init()
 
 	isLocal = os.Getenv("AWS_SAM_LOCAL") == "true" || os.Getenv("ENV") == "development"
-	log.Infow("Lambda initializing", "is_local", isLocal)
+
+	// BEHIND_PROXY controls whether this Lambda needs to emit its own CORS
+	// headers, independent of isLocal (which is only for local-dev behavior).
+	//
+	//   BEHIND_PROXY=true  -> called via CloudFront (or API Gateway). The
+	//     Function URL's own built-in CORS config is bypassed in that path,
+	//     so Lambda must set Access-Control-* headers itself.
+	//
+	//   BEHIND_PROXY=false (default) -> called directly via the raw Function
+	//     URL. AWS's Function URL service already injects CORS headers based
+	//     on the console/CLI CORS config, so Lambda does NOT need to (and
+	//     should not duplicate them here).
+	behindProxy = os.Getenv("BEHIND_PROXY") == "true"
+
+	log.Infow("Lambda initializing", "is_local", isLocal, "behind_proxy", behindProxy)
 
 	cfg = config.MustLoad()
 	log.Infow("Configuration loaded", "supabase_url", cfg.SupabaseURL)
@@ -47,15 +62,29 @@ func init() {
 	log.Info("JWT verifier initialized")
 }
 
+// getCORSHeaders returns a FRESH map every call, or nil.
+//
+// Only emit CORS headers ourselves when BEHIND_PROXY=true (i.e. traffic is
+// coming through CloudFront/API Gateway, where the Function URL's built-in
+// CORS handling is bypassed). When calling the raw Function URL directly
+// (BEHIND_PROXY=false/unset), AWS's Function URL service already injects
+// CORS headers per its own console/CLI CORS config — adding our own here
+// would just duplicate or conflict with those.
+//
+// Allow-Headers lists X-App-Authorization (not Authorization) because the
+// app's JWT travels in that custom header when going via CloudFront — OAC
+// needs to own the "Authorization" header itself for SigV4 signing. If
+// you're hitting the raw Function URL directly, its own CORS config
+// (managed separately, e.g. via `aws lambda update-function-url-config`)
+// still applies and is unaffected by this function.
 func getCORSHeaders() map[string]string {
-	if !isLocal {
-		// Production: Lambda already handles CORS
+	if !behindProxy {
 		return nil
 	}
 	return map[string]string{
 		"Access-Control-Allow-Origin":      "*",
 		"Access-Control-Allow-Methods":     "GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE",
-		"Access-Control-Allow-Headers":     "Content-Type, Authorization, X-Requested-With, Accept, Origin",
+		"Access-Control-Allow-Headers":     "Content-Type, X-App-Authorization, X-Requested-With, Accept, Origin",
 		"Access-Control-Expose-Headers":    "Content-Disposition, Content-Length, Content-Type",
 		"Access-Control-Max-Age":           "86400",
 		"Access-Control-Allow-Credentials": "false",
@@ -67,11 +96,12 @@ func getCORSHeaders() map[string]string {
 func handleRequest(ctx context.Context, request events.LambdaFunctionURLRequest) (events.LambdaFunctionURLResponse, error) {
 	defer logger.Sync()
 
-	var headers map[string]string
-	if isLocal {
-		headers = getCORSHeaders()
-	} else {
-		headers = map[string]string{} // or nil
+	// getCORSHeaders returns nil when not behind a proxy (raw Function URL
+	// mode) — normalize to an empty map so later `headers["X"] = "Y"` writes
+	// don't panic on a nil map.
+	headers := getCORSHeaders()
+	if headers == nil {
+		headers = map[string]string{}
 	}
 
 	method := request.RequestContext.HTTP.Method
