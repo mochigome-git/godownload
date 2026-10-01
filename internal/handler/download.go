@@ -2,8 +2,10 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -102,13 +104,11 @@ func (h *DownloadHandler) ProcessDownload(ctx context.Context, req *DownloadRequ
 			h.logger.Warnw("Failed to transform data, using raw data",
 				"schema", schema,
 				"table", table.Table,
-				"error", err,
-			)
-			continue
+				"error", err)
+			transformedData = table.Data
 		}
-
 		if req.IsFiveMin {
-			transformedData = groupByFiveMinutes(transformedData)
+			transformedData = groupByFiveMinutes(transformedData, FiveMinLast)
 		}
 
 		resp.Tables[i].Data = transformedData
@@ -541,52 +541,134 @@ func splitIntoBatches(items []any, batchSize int) [][]any {
 	return batches
 }
 
-// groupByFiveMinutes groups data by 5-minute intervals
-func groupByFiveMinutes(data []map[string]any) []map[string]any {
+// FiveMinMode controls how rows inside one bucket collapse into one row.
+type FiveMinMode string
+
+const (
+	FiveMinLast FiveMinMode = "last" // snapshot: last row in the bucket (safe for counters)
+	FiveMinAvg  FiveMinMode = "avg"  // average numeric fields, last value for the rest
+)
+
+// Columns that identify an entity after transformation (FK → display name).
+var fiveMinEntityKeys = []string{"machine_name", "device_name", "lot_number"}
+
+func parseAnyTime(v any) (time.Time, bool) {
+	switch t := v.(type) {
+	case time.Time:
+		return t, true
+	case string:
+		formats := []string{
+			time.RFC3339Nano,
+			"2006-01-02T15:04:05.999999-07:00",
+			"2006-01-02T15:04:05.999999",
+			"2006-01-02 15:04:05.999999-07:00",
+			"2006-01-02 15:04:05.999999-07",
+			"2006-01-02 15:04:05-07",
+			"2006-01-02 15:04:05.999999",
+			"2006-01-02 15:04:05",
+		}
+		for _, f := range formats {
+			if p, err := time.Parse(f, t); err == nil {
+				return p, true
+			}
+		}
+	}
+	return time.Time{}, false
+}
+
+func toFloat(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	}
+	return 0, false
+}
+
+// groupByFiveMinutes collapses rows into one row per (entity, 5-min bucket).
+func groupByFiveMinutes(data []map[string]any, mode FiveMinMode) []map[string]any {
 	if len(data) == 0 {
 		return data
 	}
 
-	grouped := make(map[string][]map[string]any)
+	type bucket struct {
+		bucketTime time.Time
+		lastTime   time.Time
+		last       map[string]any
+		sums       map[string]float64
+		counts     map[string]int
+	}
+
+	buckets := make(map[string]*bucket)
+	var order []string
 
 	for _, row := range data {
-		createdAt, ok := row["created_at"].(string)
+		ts, ok := parseAnyTime(row["created_at"])
 		if !ok {
-			continue
+			continue // still skip rows without a usable timestamp
+		}
+		bt := ts.Truncate(5 * time.Minute) // works for any UTC offset
+
+		var sb strings.Builder
+		for _, k := range fiveMinEntityKeys {
+			sb.WriteString(fmt.Sprint(row[k]))
+			sb.WriteByte('|')
+		}
+		sb.WriteString(bt.UTC().Format(time.RFC3339))
+		key := sb.String()
+
+		b, exists := buckets[key]
+		if !exists {
+			b = &bucket{
+				bucketTime: bt,
+				sums:       map[string]float64{},
+				counts:     map[string]int{},
+			}
+			buckets[key] = b
+			order = append(order, key)
 		}
 
-		t, err := time.Parse(time.RFC3339, createdAt)
-		if err != nil {
-			t, err = time.Parse("2006-01-02T15:04:05", createdAt)
-			if err != nil {
-				t, err = time.Parse("2006-01-02T15:04:05.999999", createdAt)
-				if err != nil {
-					continue
+		if b.last == nil || !ts.Before(b.lastTime) {
+			b.last = row
+			b.lastTime = ts
+		}
+
+		if mode == FiveMinAvg {
+			for col, val := range row {
+				if f, ok := toFloat(val); ok {
+					b.sums[col] += f
+					b.counts[col]++
 				}
 			}
 		}
-
-		minute := t.Minute()
-		roundedMinute := (minute / 5) * 5
-		roundedTime := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), roundedMinute, 0, 0, t.Location())
-		key := roundedTime.Format(time.RFC3339)
-
-		grouped[key] = append(grouped[key], row)
 	}
 
-	var result []map[string]any
-	var keys []string
-	for k := range grouped {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	for _, k := range keys {
-		for _, item := range grouped[k] {
-			item["grouped_time"] = k
-			result = append(result, item)
+	result := make([]map[string]any, 0, len(buckets))
+	for _, key := range order {
+		b := buckets[key]
+		out := make(map[string]any, len(b.last)+1)
+		for k, v := range b.last {
+			out[k] = v
 		}
+		if mode == FiveMinAvg {
+			for col, sum := range b.sums {
+				out[col] = sum / float64(b.counts[col])
+			}
+		}
+		out["created_at"] = b.bucketTime // the row now represents the bucket start
+		result = append(result, out)
 	}
 
+	sort.SliceStable(result, func(i, j int) bool {
+		return result[i]["created_at"].(time.Time).Before(result[j]["created_at"].(time.Time))
+	})
 	return result
 }

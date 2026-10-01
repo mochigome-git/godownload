@@ -173,11 +173,17 @@ func (h *ExportHandler) convertToExcelGrouped(ctx context.Context, tables []Tabl
 			continue
 		}
 
-		if len(table.Data) > 0 {
-			sampleKeys := make([]string, 0)
-			for k := range table.Data[0] {
-				sampleKeys = append(sampleKeys, k)
-			}
+		sampleKeys := make([]string, 0, len(table.Data[0]))
+		for k := range table.Data[0] {
+			sampleKeys = append(sampleKeys, k)
+		}
+		if _, ok := table.Data[0][groupBy]; !ok {
+			h.logger.Errorw("GroupBy column not found in data",
+				"table", table.Table,
+				"group_by", groupBy,
+				"available_columns", sampleKeys,
+			)
+		} else {
 			h.logger.Infow("Raw data columns before grouping",
 				"table", table.Table,
 				"columns", sampleKeys,
@@ -186,95 +192,89 @@ func (h *ExportHandler) convertToExcelGrouped(ctx context.Context, tables []Tabl
 			)
 		}
 
-		if len(table.Data) > 0 {
-			if _, ok := table.Data[0][groupBy]; !ok {
-				h.logger.Errorw("GroupBy column not found in data",
-					"group_by", groupBy,
-					"available_columns", func() []string {
-						keys := make([]string, 0)
-						for k := range table.Data[0] {
-							keys = append(keys, k)
-						}
-						return keys
-					}(),
-				)
-			}
+		schema := table.Schema
+		if schema == "" {
+			schema = "public"
 		}
 
 		groups := h.groupDataByColumn(table.Data, groupBy)
+		groupNames := h.resolveGroupNames(ctx, schema, table.Table, groupBy, groups)
+
+		// Deterministic sheet order: sort by resolved sheet name, then key
+		groupKeys := make([]string, 0, len(groups))
+		for k := range groups {
+			groupKeys = append(groupKeys, k)
+		}
+		displayName := func(k string) string {
+			if n := groupNames[k]; n != "" {
+				return n
+			}
+			return k
+		}
+		sort.SliceStable(groupKeys, func(i, j int) bool {
+			ni, nj := displayName(groupKeys[i]), displayName(groupKeys[j])
+			if ni != nj {
+				return ni < nj
+			}
+			return groupKeys[i] < groupKeys[j]
+		})
 
 		h.logger.Infow("Grouped data",
 			"table", table.Table,
 			"group_by", groupBy,
 			"groups_count", len(groups),
-			"group_keys", func() []string {
-				keys := make([]string, 0)
-				for k := range groups {
-					keys = append(keys, k)
-				}
-				return keys
-			}(),
+			"group_names", groupNames,
 		)
 
-		schema := table.Schema
-		if schema == "" {
-			schema = "public"
+		excludeColumn := h.getOutputNameForColumn(schema, table.Table, groupBy)
+		if excludeColumn == "" {
+			excludeColumn = groupBy
 		}
-		groupNames := h.resolveGroupNames(ctx, schema, table.Table, groupBy, groups)
 
-		h.logger.Infow("Resolved group names", "group_names", groupNames)
-
-		for groupKey, groupData := range groups {
+		for _, groupKey := range groupKeys {
+			groupData := groups[groupKey]
 			if len(groupData) == 0 {
 				continue
 			}
 
-			sheetName := groupNames[groupKey]
-			if sheetName == "" {
-				sheetName = groupKey
-			}
-
-			sheetName = h.getUniqueSheetName(sheetName, usedSheetNames)
-
-			h.logger.Infow("Creating sheet for group",
-				"group_key", groupKey,
-				"sheet_name", sheetName,
-				"rows", len(groupData),
-			)
-
-			if !sheetCreated {
-				f.SetSheetName(defaultSheet, sheetName)
-				sheetCreated = true
-			} else {
-				_, err := f.NewSheet(sheetName)
-				if err != nil {
-					h.logger.Warnw("Failed to create sheet",
-						"sheet_name", sheetName,
-						"error", err,
-					)
-					continue
-				}
-			}
-
+			// Transform + aggregate BEFORE creating the sheet
 			transformedData, err := h.downloadHandler.transformer.TransformTableData(ctx, schema, table.Table, groupData)
 			if err != nil {
-				h.logger.Warnw("Failed to transform group data, using raw data", "error", err)
+				h.logger.Warnw("Failed to transform group data, using raw data",
+					"group_key", groupKey,
+					"error", err,
+				)
 				transformedData = groupData
 			}
 
 			if isFiveMin {
-				transformedData = groupByFiveMinutes(transformedData)
+				before := len(transformedData)
+				transformedData = groupByFiveMinutes(transformedData, FiveMinLast)
+				h.logger.Infow("Applied 5-min aggregation",
+					"group_key", groupKey,
+					"rows_before", before,
+					"rows_after", len(transformedData),
+				)
 			}
 
-			excludeColumn := h.getOutputNameForColumn(schema, table.Table, groupBy)
-			if excludeColumn == "" {
-				excludeColumn = groupBy
+			if len(transformedData) == 0 {
+				continue
+			}
+
+			sheetName := h.getUniqueSheetName(displayName(groupKey), usedSheetNames)
+
+			if !sheetCreated {
+				f.SetSheetName(defaultSheet, sheetName)
+				sheetCreated = true
+			} else if _, err := f.NewSheet(sheetName); err != nil {
+				h.logger.Warnw("Failed to create sheet", "sheet_name", sheetName, "error", err)
+				continue
 			}
 
 			h.logger.Debugw("Writing sheet data",
 				"sheet_name", sheetName,
 				"exclude_column", excludeColumn,
-				"transformed_rows", len(transformedData),
+				"rows", len(transformedData),
 			)
 
 			h.writeSheetData(f, sheetName, transformedData, headerMap, excludeColumn)
@@ -514,10 +514,41 @@ func (h *ExportHandler) convertToExcel(ctx context.Context, tables []TableData, 
 
 	defaultSheet := f.GetSheetName(0)
 	usedSheetNames := make(map[string]int)
+	sheetCreated := false
 
-	for i, table := range tables {
+	for _, table := range tables {
 		if len(table.Data) == 0 {
 			continue
+		}
+
+		schema := table.Schema
+		if schema == "" {
+			schema = "public"
+		}
+
+		transformedData, err := h.downloadHandler.transformer.TransformTableData(ctx, schema, table.Table, table.Data)
+		if err != nil {
+			h.logger.Warnw("Failed to transform data, using raw data",
+				"schema", schema,
+				"table", table.Table,
+				"error", err,
+			)
+			transformedData = table.Data
+		}
+
+		if isFiveMin {
+			before := len(transformedData)
+			transformedData = groupByFiveMinutes(transformedData, FiveMinLast)
+			h.logger.Infow("Applied 5-min aggregation",
+				"schema", schema,
+				"table", table.Table,
+				"rows_before", before,
+				"rows_after", len(transformedData),
+			)
+		}
+
+		if len(transformedData) == 0 {
+			continue // e.g. every row lacked a usable created_at
 		}
 
 		sheetName := table.Table
@@ -526,27 +557,19 @@ func (h *ExportHandler) convertToExcel(ctx context.Context, tables []TableData, 
 		}
 		sheetName = h.getUniqueSheetName(sheetName, usedSheetNames)
 
-		if i == 0 {
+		if !sheetCreated {
 			f.SetSheetName(defaultSheet, sheetName)
-		} else {
-			f.NewSheet(sheetName)
-		}
-
-		schema := table.Schema
-		if schema == "" {
-			schema = "public"
-		}
-		transformedData, err := h.downloadHandler.transformer.TransformTableData(ctx, schema, table.Table, table.Data)
-		if err != nil {
-			h.logger.Warnw("Failed to transform data, using raw data", "error", err)
-			transformedData = table.Data
-		}
-
-		if isFiveMin {
-			transformedData = groupByFiveMinutes(transformedData)
+			sheetCreated = true
+		} else if _, err := f.NewSheet(sheetName); err != nil {
+			h.logger.Warnw("Failed to create sheet", "sheet_name", sheetName, "error", err)
+			continue
 		}
 
 		h.writeSheetData(f, sheetName, transformedData, headerMap, "")
+	}
+
+	if !sheetCreated {
+		f.SetCellValue(defaultSheet, "A1", "No data")
 	}
 
 	buf, err := f.WriteToBuffer()
@@ -873,7 +896,18 @@ func (h *ExportHandler) convertToExcelBySheet(
 
 		inline := len(cfg.Rows) > 0
 		if isFiveMin && !inline {
-			data = groupByFiveMinutes(data)
+			before := len(data)
+			data = groupByFiveMinutes(data, FiveMinLast)
+			h.logger.Infow("Applied 5-min aggregation",
+				"sheet", name,
+				"table", table.Table,
+				"rows_before", before,
+				"rows_after", len(data),
+			)
+		}
+
+		if len(data) == 0 {
+			continue
 		}
 
 		s := byName[name]
@@ -901,6 +935,10 @@ func (h *ExportHandler) convertToExcelBySheet(
 	created := false
 
 	for _, s := range order {
+		if len(s.rows) == 0 {
+			continue
+		}
+
 		name := h.getUniqueSheetName(s.name, used)
 		if !created {
 			f.SetSheetName(defaultSheet, name)
