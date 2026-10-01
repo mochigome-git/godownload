@@ -54,6 +54,8 @@ func NewExportHandler(downloadHandler *DownloadHandler, logger *zap.SugaredLogge
 		tz = time.UTC
 	}
 
+	downloadHandler.transformer.rejectLabelsOn = true
+
 	return &ExportHandler{
 		downloadHandler: downloadHandler,
 		supabaseClient:  downloadHandler.client,

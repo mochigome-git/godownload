@@ -20,15 +20,20 @@ type DataTransformer struct {
 	// Cache for foreign key lookups: "schema.table" -> { "fk_value" -> "display_value" }
 	fkCache   map[string]map[string]string
 	fkCacheMu sync.RWMutex
+
+	rejectLabelsOn bool                         // set by the export handler
+	rejectLabels   map[string]map[string]string // machine_id -> CODE -> name
+	rejectMu       sync.RWMutex
 }
 
 // NewDataTransformer creates a new data transformer
 func NewDataTransformer(client *supabase.Client, cfg *config.Config, logger *zap.SugaredLogger) *DataTransformer {
 	return &DataTransformer{
-		client:  client,
-		config:  cfg,
-		logger:  logger,
-		fkCache: make(map[string]map[string]string),
+		client:       client,
+		config:       cfg,
+		logger:       logger,
+		fkCache:      make(map[string]map[string]string),
+		rejectLabels: make(map[string]map[string]string),
 	}
 }
 
@@ -98,6 +103,9 @@ func (t *DataTransformer) TransformTableData(
 		}
 	}
 
+	if t.rejectLabelsOn && hasRejectKeys(data) {
+		t.prefetchRejectLabels(ctx, rejectMachineColumn, data)
+	}
 	// Transform each row
 	result := make([]map[string]any, 0, len(data))
 	for _, row := range data {
@@ -268,6 +276,10 @@ func (t *DataTransformer) transformRow(schema, table string, row map[string]any,
 		result[key] = value
 	}
 
+	if t.rejectLabelsOn {
+		t.applyRejectLabels(result, row[rejectMachineColumn])
+	}
+
 	// Apply FK joins (add display columns)
 	for _, mapping := range mappings {
 		// Get the FK value
@@ -348,6 +360,9 @@ func (t *DataTransformer) ClearCache() {
 	t.fkCacheMu.Lock()
 	t.fkCache = make(map[string]map[string]string)
 	t.fkCacheMu.Unlock()
+	t.rejectMu.Lock()
+	t.rejectLabels = make(map[string]map[string]string)
+	t.rejectMu.Unlock()
 }
 
 // min returns the smaller of two ints

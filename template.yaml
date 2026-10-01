@@ -1,6 +1,10 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: Supabase goDownload Service Lambda with Function URL
+Description: Supabase goDownload Service Lambda with Function URL (behind CloudFront)
+
+# Every runtime setting lives here. `sam deploy` resets the function to
+# exactly this template, so anything changed only in the console is lost
+# on the next deploy. Change settings here (or in .env), never in the console.
 
 Globals:
   Function:
@@ -10,18 +14,31 @@ Globals:
 Parameters:
   SupabaseUrl:
     Type: String
-    Description: Supabase project URL
   SupabaseServiceKey:
     Type: String
-    Description: Supabase service key
     NoEcho: true
   Environment:
     Type: String
     Default: production
-    AllowedValues:
-      - development
-      - production
-    Description: Environment (development or production)
+    AllowedValues: [development, production]
+  FlattenJsonb:
+    Type: String
+    Default: ""
+  HiddenColumns:
+    Type: String
+    Default: ""
+  JoinMappings:
+    Type: String
+    Default: ""
+  StorageBucket:
+    Type: String
+    Default: godownload
+  StorageExportPath:
+    Type: String
+    Default: exports/
+  StorageExpiryHours:
+    Type: String
+    Default: "24"
 
 Resources:
   DownloadFunction:
@@ -32,37 +49,30 @@ Resources:
       Handler: bootstrap
       Runtime: provided.al2023
       Architectures:
-        - arm64 # Use Graviton2 for ~20% cost savings
-        # - x86_64
+        - arm64
       Environment:
         Variables:
           SUPABASE_URL: !Ref SupabaseUrl
           SUPABASE_SERVICE_KEY: !Ref SupabaseServiceKey
           ENV: !Ref Environment
-      # Lambda Function URL - no 30s timeout limit!
+          # Called via CloudFront: the Lambda sends CORS headers itself
+          BEHIND_PROXY: "true"
+          FLATTEN_JSONB: !Ref FlattenJsonb
+          HIDDEN_COLUMNS: !Ref HiddenColumns
+          JOIN_MAPPINGS: !Ref JoinMappings
+          SUPABASE_STORAGE_BUCKET: !Ref StorageBucket
+          SUPABASE_STORAGE_EXPORT_PATH: !Ref StorageExportPath
+          SUPABASE_STORAGE_EXPIRY_HOURS: !Ref StorageExpiryHours
       FunctionUrlConfig:
+        # Keep this matching what CloudFront expects:
+        #   NONE    = public URL (current)
+        #   AWS_IAM = only CloudFront (OAC) can call it
         AuthType: NONE
-        Cors:
-          AllowOrigins:
-            - "*"
-          AllowMethods:
-            - GET
-            - POST
-          AllowHeaders:
-            - Content-Type
-            - Authorization
-            - X-Requested-With
-            - Accept
-            - Origin
-          ExposeHeaders:
-            - Content-Disposition
-            - Content-Length
-            - Content-Type
-          MaxAge: 86400
+        # No Cors block: behind CloudFront the Lambda handles CORS
+        # (BEHIND_PROXY=true). Two CORS sources = duplicate headers.
     Metadata:
       BuildMethod: makefile
 
-  # CloudWatch Log Group
   DownloadFunctionLogGroup:
     Type: AWS::Logs::LogGroup
     DeletionPolicy: Delete
@@ -73,11 +83,6 @@ Resources:
 
 Outputs:
   FunctionUrl:
-    Description: Lambda Function URL (use this!)
     Value: !GetAtt DownloadFunctionUrl.FunctionUrl
   FunctionArn:
-    Description: Lambda function ARN
     Value: !GetAtt DownloadFunction.Arn
-  FunctionName:
-    Description: Lambda function name
-    Value: !Ref DownloadFunction

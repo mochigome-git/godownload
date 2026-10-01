@@ -6,8 +6,19 @@ export
 
 # Variables
 FUNCTION_NAME ?= godownload
-AWS_REGION ?= ap-southeast-1
+REGION_CACHE := .lambda-region
+AWS_REGION   ?= $(shell cat $(REGION_CACHE) 2>/dev/null || echo ap-northeast-1)
 STACK_NAME ?= go-download-stack
+
+
+# Find the region that has $(FUNCTION_NAME); cached after the first search
+$(REGION_CACHE):
+	@echo "🔎 Looking for $(FUNCTION_NAME)..."
+	@for r in $$(aws ec2 describe-regions --query 'Regions[].RegionName' --output text); do \
+		if aws lambda get-function --function-name $(FUNCTION_NAME) --region $$r >/dev/null 2>&1; then \
+			echo $$r > $@; echo "✅ Found in $$r"; exit 0; \
+		fi; \
+	done; echo "❌ $(FUNCTION_NAME) not found in any region"; exit 1
 
 # =============================================================================
 # LOCAL DEVELOPMENT
@@ -106,7 +117,13 @@ deploy: build-arm
 	@echo "🚀 Building with SAM..."
 	sam build --template template.yaml
 	@echo "🚀 Deploying with SAM..."
-	sam deploy --template template.yaml
+	sam deploy --template template.yaml --region $(AWS_REGION) \
+			--parameter-overrides \
+				SupabaseUrl="$(SUPABASE_URL)" \
+				SupabaseServiceKey="$(SUPABASE_SERVICE_KEY)" \
+				FlattenJsonb="$(FLATTEN_JSONB)" \
+				HiddenColumns="$(HIDDEN_COLUMNS)" \
+				JoinMappings="$(JOIN_MAPPINGS)"
 
 # Deploy with specific parameters
 deploy-prod: build-arm
@@ -141,12 +158,12 @@ create-function: build-arm
 	@echo "✅ Function created!"
 
 # Update existing Lambda function code
-update-function: build-arm
+update-function: build-arm $(REGION_CACHE)
 	@echo "🔄 Updating Lambda function code..."
 	aws lambda update-function-code \
 		--function-name $(FUNCTION_NAME) \
 		--zip-file fileb://deployment.zip \
-		--region $(AWS_REGION)
+		--region $$(cat $(REGION_CACHE))
 	@echo "✅ Function updated!"
 
 # Update Lambda function configuration
