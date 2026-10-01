@@ -40,6 +40,14 @@ type TableConfig struct {
 	// For batch IN queries
 	InColumn string `json:"in_column,omitempty"`
 	InValues []any  `json:"in_values,omitempty"`
+
+	// Export layout (export only; ignored by /download)
+	SheetName   string   `json:"sheet_name,omitempty"`   // tables sharing a name stack onto one sheet
+	Columns     []string `json:"columns,omitempty"`      // put first, in this order
+	HideColumns []string `json:"hide_columns,omitempty"` // dropped after transformation
+
+	// Inline rows: used as-is, no query. Still transformed (reject labels).
+	Rows []map[string]any `json:"rows,omitempty"`
 }
 
 type OrderConfig struct {
@@ -205,6 +213,11 @@ func (h *DownloadHandler) processTable(
 	batchSize int,
 	sem chan struct{},
 ) ([]map[string]any, error) {
+	// Inline rows: the caller already has the data
+	if len(config.Rows) > 0 {
+		return config.Rows, nil
+	}
+
 	// If we have IN values, use the old batch IN query method
 	if config.InColumn != "" && len(config.InValues) > 0 {
 		return h.processTableWithInValues(ctx, config, batchSize, sem)

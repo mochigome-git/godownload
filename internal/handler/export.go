@@ -92,9 +92,12 @@ func (h *ExportHandler) ProcessExport(ctx context.Context, req *ExportRequest, u
 	}
 
 	var excelData []byte
-	if req.GroupBy != "" {
+	switch {
+	case usesSheetLayout(req.Tables):
+		excelData, err = h.convertToExcelBySheet(ctx, req.Tables, downloadResp.Tables, req.HeaderMap, req.IsFiveMin)
+	case req.GroupBy != "":
 		excelData, err = h.convertToExcelGrouped(ctx, downloadResp.Tables, req.HeaderMap, req.GroupBy, req.IsFiveMin)
-	} else {
+	default:
 		excelData, err = h.convertToExcel(ctx, downloadResp.Tables, req.HeaderMap, req.IsFiveMin)
 	}
 
@@ -115,7 +118,6 @@ func (h *ExportHandler) ProcessExport(ctx context.Context, req *ExportRequest, u
 	}
 
 	// Upload to Supabase Storage using service key (NOT JWT)
-	// Pass the supabase client that has service key configured
 	storageHandler := NewStorageHandler(h.supabaseClient, h.config, h.logger)
 	filePath, err := storageHandler.UploadFile(ctx, fileName, excelData, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 	if err != nil {
@@ -441,8 +443,10 @@ func (h *ExportHandler) getUniqueSheetName(name string, used map[string]int) str
 		return r
 	}, name)
 
-	if len(name) > 28 {
-		name = name[:28]
+	// Excel caps sheet names at 31 characters; 28 leaves room for "_N".
+	// Cut by rune, not byte, so Japanese names aren't split mid-character.
+	if r := []rune(name); len(r) > 28 {
+		name = string(r[:28])
 	}
 
 	if name == "" {
@@ -465,9 +469,11 @@ func (h *ExportHandler) writeSheetData(f *excelize.File, sheetName string, data 
 	}
 
 	h.sortByCreatedAt(data)
+	h.writeRows(f, sheetName, data, headerMap, h.getColumnOrder(data, excludeColumn))
+}
 
-	columns := h.getColumnOrder(data, excludeColumn) // ← was data[0], now data
-
+// writeRows writes a header row plus data rows in the given column order.
+func (h *ExportHandler) writeRows(f *excelize.File, sheetName string, data []map[string]any, headerMap map[string]string, columns []string) {
 	for colIdx, colName := range columns {
 		cell, _ := excelize.CoordinatesToCellName(colIdx+1, 1)
 		headerName := colName
@@ -803,4 +809,155 @@ func (h *ExportHandler) generateFileName(tables []TableConfig) string {
 
 func parseFloat(s string) (float64, error) {
 	return strconv.ParseFloat(s, 64)
+}
+
+// ----------------------------------------------------------------------
+// Sheet layout: tables name their own sheet (sheet_name), tables sharing
+// a name stack onto one sheet, inline rows are allowed.
+// ----------------------------------------------------------------------
+
+func usesSheetLayout(tables []TableConfig) bool {
+	for _, t := range tables {
+		if t.SheetName != "" || len(t.Rows) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+type layoutSheet struct {
+	name    string
+	rows    []map[string]any
+	columns []string
+	hidden  map[string]bool
+	inline  bool // keep caller's row order instead of sorting by created_at
+}
+
+// convertToExcelBySheet writes each table to the sheet it names, in request
+// order. ProcessDownloadRaw keeps results at the same index as the request,
+// so cfgs[i] describes tables[i].
+func (h *ExportHandler) convertToExcelBySheet(
+	ctx context.Context,
+	cfgs []TableConfig,
+	tables []TableData,
+	headerMap map[string]string,
+	isFiveMin bool,
+) ([]byte, error) {
+	var order []*layoutSheet
+	byName := make(map[string]*layoutSheet)
+
+	for i, table := range tables {
+		if i >= len(cfgs) || len(table.Data) == 0 {
+			continue
+		}
+		cfg := cfgs[i]
+
+		schema := table.Schema
+		if schema == "" {
+			schema = "public"
+		}
+
+		name := cfg.SheetName
+		if name == "" {
+			name = table.Table
+			if table.Schema != "" && table.Schema != "public" {
+				name = table.Schema + "_" + table.Table
+			}
+		}
+
+		data, err := h.downloadHandler.transformer.TransformTableData(ctx, schema, table.Table, table.Data)
+		if err != nil {
+			h.logger.Warnw("Failed to transform data, using raw data", "table", table.Table, "error", err)
+			data = table.Data
+		}
+
+		inline := len(cfg.Rows) > 0
+		if isFiveMin && !inline {
+			data = groupByFiveMinutes(data)
+		}
+
+		s := byName[name]
+		if s == nil {
+			s = &layoutSheet{name: name, hidden: make(map[string]bool), inline: inline}
+			byName[name] = s
+			order = append(order, s)
+		}
+		s.rows = append(s.rows, data...)
+		for _, c := range cfg.Columns {
+			if !containsString(s.columns, c) {
+				s.columns = append(s.columns, c)
+			}
+		}
+		for _, c := range cfg.HideColumns {
+			s.hidden[c] = true
+		}
+	}
+
+	f := excelize.NewFile()
+	defer f.Close()
+
+	defaultSheet := f.GetSheetName(0)
+	used := make(map[string]int)
+	created := false
+
+	for _, s := range order {
+		name := h.getUniqueSheetName(s.name, used)
+		if !created {
+			f.SetSheetName(defaultSheet, name)
+			created = true
+		} else if _, err := f.NewSheet(name); err != nil {
+			h.logger.Warnw("Failed to create sheet", "sheet_name", name, "error", err)
+			continue
+		}
+
+		if !s.inline {
+			h.sortByCreatedAt(s.rows)
+		}
+		h.writeRows(f, name, s.rows, headerMap, h.orderedColumns(s.rows, s.columns, s.hidden))
+	}
+
+	if !created {
+		f.SetCellValue(defaultSheet, "A1", "No data")
+	}
+
+	buf, err := f.WriteToBuffer()
+	if err != nil {
+		return nil, fmt.Errorf("failed to write Excel buffer: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+// orderedColumns: preferred columns first (in their order, if present),
+// then everything else in the usual order, minus hidden ones.
+func (h *ExportHandler) orderedColumns(data []map[string]any, preferred []string, hidden map[string]bool) []string {
+	rest := h.getColumnOrder(data, "")
+	present := make(map[string]bool, len(rest))
+	for _, c := range rest {
+		present[c] = true
+	}
+
+	out := make([]string, 0, len(rest))
+	taken := make(map[string]bool, len(rest))
+	for _, c := range preferred {
+		if present[c] && !hidden[c] && !taken[c] {
+			out = append(out, c)
+			taken[c] = true
+		}
+	}
+	for _, c := range rest {
+		if !hidden[c] && !taken[c] {
+			out = append(out, c)
+			taken[c] = true
+		}
+	}
+	return out
+}
+
+func containsString(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
